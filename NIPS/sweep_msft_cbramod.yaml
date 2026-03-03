@@ -1,0 +1,75 @@
+program: finetune_msft_improved.py
+method: grid
+name: msft_cbramod_ablation_comprehensive
+
+# 项目配置
+project: eeg-msft-improved-ablation
+entity: null  # 如果有team，填入team名称
+
+# 固定参数
+parameters:
+  model:
+    value: cbramod
+
+  # 数据集：TUEV和TUAB
+  dataset:
+    values: [TUEV, TUAB]
+
+  # MSFT改进的Ablation Study - 4个变体
+  use_pos_refiner:
+    values: [true, false]
+
+  use_criss_cross_agg:
+    values: [true, false]
+
+  # Scale数量
+  num_scales:
+    values: [2, 3, 4]
+
+  # 训练超参数
+  epochs:
+    value: 50
+
+  batch_size:
+    values: [32, 64]
+
+  lr:
+    values: [5e-4, 1e-3, 2e-3]
+
+  weight_decay:
+    values: [5e-2, 1e-1]
+
+  dropout:
+    values: [0.1, 0.2]
+
+  label_smoothing:
+    value: 0.1
+
+  clip_value:
+    value: 1.0
+
+  # 固定随机种子确保可复现性
+  seed:
+    value: 3407
+
+  # 架构参数
+  n_layer:
+    value: 12
+
+  dim_feedforward:
+    value: 800
+
+  nhead:
+    value: 8
+
+  # WandB设置
+  wandb_project:
+    value: eeg-msft-improved-ablation
+
+  no_wandb:
+    value: false
+
+# Metric to optimize (用于Bayesian sweep，这里用grid所以不需要)
+# metric:
+#   name: final_test/balanced_acc
+#   goal: maximize

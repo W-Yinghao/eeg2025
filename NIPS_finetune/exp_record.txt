@@ -1,0 +1,60 @@
+739434 scripts/run_mi_finetune.sh
+739889 scripts/run_scope_finetune.sh
+739428 scripts/run_cbramod_msft.sh
+739426 scripts/run_codebrain_msft.sh
+739422 scripts/run_full_finetune.sh
+739420 scripts/run_ib.sh TUEV
+739418 scripts/run_linear_probe.sh
+739416 scripts/run_ib.sh TUAB
+740097 ./run_sagestream.sh cbramod TUEV
+    moe-only 0.4649
+    no-style 0.4373
+740306 ./run_sagestream.sh cbramod TUAB
+    no_style 0.7184
+    deep-moe fail
+    low_expert 0.6299
+    high_expert fail
+    moe-only 0.7274
+    baseline_ce 0.706
+    iib_only 0.70257
+    full sagestream 0.5886
+
+740099 ./run_sagestream.sh codebrain TUEV
+    moe-only 0.5246
+    iib-only 0.4788
+    no-style 0.5276
+    baseline-ce 0.4803
+
+740307 ./run_sagestream.sh codebrain TUAB
+    low_expert 0.68307
+    high_expert 0.64845
+    baseline-ce 0.79
+    iib-only 0.79086
+    moe-only 0.81438
+    full sagestream 0.68262
+
+740836 run_sagestream.sh codebrain TUEV
+740835 run_sagestream.sh codebrain TUAB
+740837 run_sagestream.sh cbramod TUEV (3/8完成，5/8 segfault段错误
+740838 run_sagestream.sh cbramod TUAB (2/8完成，5/8未执行)
+
+740851 run_ib.sh cbramod TUAB batch1
+740852 run_ib.sh cbramod TUAB batch2
+740853 run_ib.sh codebrain TUAB batch1
+740854 run_ib.sh codebrain TUAB batch2
+740855 run_ib.sh codebrain TUEV batch1
+740856 run_ib.sh codebrain TUEV batch2
+740857 run_ib.sh cbramod TUEV batch1
+740858 run_ib.sh cbramod TUEV batch2
+
+#######03/03######
+741601 run_ib.sh cbramod TUAB batch1
+741602 run_ib.sh cbramod TUAB batch2
+741604 run_ib.sh codebrain TUAB batch1
+741605 run_ib.sh codebrain TUAB batch2
+741607 run_ib.sh codebrain TUEV batch1
+741608 run_ib.sh codebrain TUEV batch2
+741609 run_ib.sh cbramod TUEV batch1
+741615 run_ib.sh cbramod TUEV batch2
+
+

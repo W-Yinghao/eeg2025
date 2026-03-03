@@ -1,0 +1,102 @@
+program: finetune_msft_improved.py
+method: bayes
+name: msft_cbramod_bayesian_optimization
+
+# 项目配置
+project: eeg-msft-improved-bayes
+entity: null  # 如果有team，填入team名称
+
+# Bayesian优化的metric
+metric:
+  name: final_test/balanced_acc
+  goal: maximize
+
+# 固定参数
+parameters:
+  model:
+    value: cbramod
+
+  # 数据集
+  dataset:
+    values: [TUEV, TUAB]
+
+  # 训练epoch
+  epochs:
+    value: 50
+
+  # 固定随机种子
+  seed:
+    value: 3407
+
+  # 架构参数
+  n_layer:
+    value: 12
+
+  dim_feedforward:
+    value: 800
+
+  nhead:
+    value: 8
+
+  # WandB设置
+  wandb_project:
+    value: eeg-msft-improved-bayes
+
+  no_wandb:
+    value: false
+
+  # === Bayesian搜索空间 ===
+
+  # MSFT改进ablation
+  use_pos_refiner:
+    values: [true, false]
+
+  use_criss_cross_agg:
+    values: [true, false]
+
+  # Scale数量
+  num_scales:
+    distribution: int_uniform
+    min: 2
+    max: 4
+
+  # 批量大小
+  batch_size:
+    values: [32, 64, 128]
+
+  # 学习率
+  lr:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 5e-3
+
+  # 权重衰减
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-2
+    max: 2e-1
+
+  # Dropout
+  dropout:
+    distribution: uniform
+    min: 0.05
+    max: 0.3
+
+  # Label smoothing
+  label_smoothing:
+    distribution: uniform
+    min: 0.0
+    max: 0.2
+
+  # Gradient clipping
+  clip_value:
+    distribution: uniform
+    min: 0.5
+    max: 2.0
+
+# 提前停止条件
+early_terminate:
+  type: hyperband
+  min_iter: 10
+  eta: 2
+  s: 3

@@ -1,0 +1,771 @@
+\documentclass{article}
+
+% NeurIPS 2025 style
+\usepackage[final]{neurips_2025}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{bm}
+
+% Math operators
+\DeclareMathOperator{\acosh}{acosh}
+\DeclareMathOperator{\asinh}{asinh}
+\DeclareMathOperator{\sign}{sign}
+\DeclareMathOperator{\KL}{KL}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\diag}{diag}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Lo}{\mathbb{L}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\mL}{\mathcal{L}}
+\newcommand{\mH}{\mathcal{H}}
+\newcommand{\mN}{\mathcal{N}}
+\newcommand{\bx}{\bm{x}}
+\newcommand{\bz}{\bm{z}}
+\newcommand{\bmu}{\bm{\mu}}
+\newcommand{\bsigma}{\bm{\sigma}}
+\newcommand{\inner}[2]{\langle #1, #2 \rangle}
+
+\title{Fine-Tuning Strategies for EEG Foundation Models:\\
+A Comprehensive Technical Reference}
+
+\author{
+  EEG Foundation Model Project \\
+  \texttt{NIPS\_finetune/}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides a comprehensive technical reference for all fine-tuning methods implemented in the \texttt{NIPS\_finetune/} framework.
+We present five distinct approaches to adapting pretrained EEG foundation models (CodeBrain SSSM and CBraMod) to downstream classification tasks:
+(1)~\textbf{Standard Fine-Tuning} as baseline,
+(2)~\textbf{Multi-Scale Fine-Tuning (MSFT)} with inter-layer cross-scale aggregation,
+(3)~\textbf{Hyperbolic Fine-Tuning} with Lorentz manifold embeddings and domain-specific batch normalization,
+(4)~\textbf{Mutual Information Fine-Tuning} combining variational information bottleneck with expert-guided InfoNCE,
+and (5)~\textbf{Information Bottleneck + Disentanglement} with token-level compression and adversarial subject removal.
+For each method, we provide precise mathematical formulations, algorithmic pseudocode, and architectural specifications.
+Additionally, we describe a shared \textbf{Backbone Factory} with optional inter-layer bottleneck adapters for CBraMod.
+\end{abstract}
+
+%=============================================================================
+\section{Preliminaries}
+\label{sec:prelim}
+%=============================================================================
+
+\subsection{EEG Foundation Model Backbones}
+
+All methods operate on a pretrained backbone $f_\theta$ that maps raw EEG segments to token-level representations.
+The input is a 4D tensor $\bx \in \R^{B \times C \times S \times P}$ where $B$ is the batch size, $C$ is the number of EEG channels, $S$ is the number of temporal patches, and $P = 200$ is the patch size (samples per patch).
+The backbone output is $\bm{H} = f_\theta(\bx) \in \R^{B \times C \times S \times D}$ with $D = 200$ for both backbones.
+
+\paragraph{CodeBrain (SSSM).}
+An S4-based state space model with $L = 8$ bidirectional residual blocks, diffusion-step embeddings, and optional VQ codebooks ($\text{codebook\_size} = 4096$).
+The S4 sequence length is computed as $\text{s4\_lmax} = \lceil C \cdot S / 19 \rceil \times 19$.
+
+\paragraph{CBraMod.}
+A Criss-Cross Transformer with $L = 12$ layers, $d_\text{model} = 200$, $d_\text{ff} = 800$, $h = 8$ attention heads.
+Each layer applies spatial attention (across channels) and temporal attention (across patches) in a criss-cross pattern.
+The patch embedding module combines convolutional projection with spectral (FFT-based) features and learned depthwise-convolutional positional encoding.
+
+\subsection{Notation}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Description \\
+\midrule
+$B, C, S, P, D$ & batch size, channels, temporal patches, patch size, feature dim \\
+$T = C \times S$ & total number of tokens \\
+$f_\theta$ & pretrained backbone (frozen unless noted) \\
+$K < 0$ & negative curvature of hyperbolic space (default $-1$) \\
+$\inner{\cdot}{\cdot}_\Lo$ & Minkowski inner product \\
+$\oplus_K, \ominus_K, \otimes_K$ & Lorentz gyro-addition, inverse, scalar multiplication \\
+$\mL_\text{CE}, \mL_\text{BCE}$ & cross-entropy, binary cross-entropy with logits \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Method 1: Standard Fine-Tuning (Baseline)}
+\label{sec:baseline}
+%=============================================================================
+
+\subsection{Architecture}
+
+The baseline approach applies a multi-layer perceptron (MLP) classifier directly on the flattened backbone output.
+The backbone may be either fully fine-tuned ($\texttt{--frozen False}$) or frozen ($\texttt{--frozen True}$, equivalent to linear probing).
+
+\paragraph{Forward pass.}
+\begin{equation}
+\bm{H} = f_\theta(\bx) \in \R^{B \times C \times S \times D}, \quad
+\hat{\bm{y}} = g_\phi\!\left(\text{flatten}(\bm{H})\right) \in \R^{B \times N_\text{cls}}
+\end{equation}
+where $g_\phi$ is the classifier head.
+
+\paragraph{Classifier head} (default \texttt{all\_patch\_reps}, 3-layer MLP):
+\begin{equation}
+g_\phi(\bm{h}) = W_3\, \sigma\!\left( W_2\, \sigma\!\left( W_1 \bm{h} \right)\right)
+\end{equation}
+with $W_1 \in \R^{(S \cdot D) \times (C \cdot S \cdot D)}$, $W_2 \in \R^{D \times (S \cdot D)}$, $W_3 \in \R^{N_\text{cls} \times D}$, where $\sigma(\cdot) = \text{ELU}(\cdot)$ followed by dropout.
+
+\subsection{Loss Function}
+
+\begin{equation}
+\mL = \mL_\text{CE}(\hat{\bm{y}}, \bm{y})
+\end{equation}
+For binary tasks, $\mL_\text{BCE}$ is used with sigmoid output (single logit).
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{Standard Fine-Tuning}
+\begin{algorithmic}[1]
+\REQUIRE Pretrained backbone $f_\theta$, classifier $g_\phi$, dataset $\mathcal{D}$
+\FOR{each epoch}
+  \FOR{each mini-batch $(\bx, \bm{y}) \sim \mathcal{D}$}
+    \STATE $\bm{H} \leftarrow f_\theta(\bx)$ \COMMENT{Full backbone, optionally frozen}
+    \STATE $\hat{\bm{y}} \leftarrow g_\phi(\text{flatten}(\bm{H}))$
+    \STATE $\mL \leftarrow \mL_\text{CE}(\hat{\bm{y}}, \bm{y})$
+    \STATE Update $\theta, \phi$ (or only $\phi$ if frozen) via $\nabla \mL$
+  \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+%=============================================================================
+\section{Method 2: Multi-Scale Fine-Tuning (MSFT)}
+\label{sec:msft}
+%=============================================================================
+
+\subsection{Overview}
+MSFT~\cite{qiao2025msft} injects \emph{trainable} cross-scale aggregation modules between the \emph{frozen} layers of the pretrained backbone.
+The key idea is to generate multi-scale inputs via temporal downsampling and exchange information between scales at each layer, enabling the frozen backbone to process multi-resolution features.
+
+\subsection{Multi-Scale Input Generation}
+
+Given input $\bx \in \R^{B \times C \times S \times P}$, we generate $K+1$ scales ($k = 0, 1, \ldots, K$, default $K=2$ giving 3 scales) by recursive average pooling along the temporal dimension:
+\begin{equation}
+\bx^{(0)} = \bx, \quad
+\bx^{(k)} = \text{AvgPool1D}\!\left(\bx^{(k-1)},\, \text{kernel}=2,\, \text{stride}=2\right), \quad
+S_k = \left\lceil S / 2^k \right\rceil
+\end{equation}
+
+\subsection{Scale Adapter}
+
+Each scale passes through a \emph{trainable} residual adapter after the frozen patch embedding:
+\begin{equation}
+\text{ScaleAdapter}(\bm{e}) = \bm{e} + \text{GELU}(W_\text{adapt}\, \bm{e} + b_\text{adapt}), \quad W_\text{adapt} \in \R^{D \times D}
+\end{equation}
+
+\subsection{Cross-Scale Aggregation}
+
+At each frozen transformer/residual layer $\ell$, a trainable \texttt{CrossScaleAggregator} exchanges information between scales via bidirectional coarse-to-fine (C2F) and fine-to-coarse (F2C) pathways.
+
+\paragraph{Coarse-to-Fine (C2F).}
+For $k = K, K{-}1, \ldots, 1$:
+\begin{equation}
+\tilde{\bm{h}}^{(k-1)}_\text{c2f} = \bm{h}^{(k-1)} + \text{Upsample}\!\left(W^{(\ell)}_{\text{c2f},k}\, \bm{h}^{(k)},\; S_{k-1}\right)
+\end{equation}
+where $\text{Upsample}$ uses nearest-neighbor interpolation and $W^{(\ell)}_{\text{c2f},k} \in \R^{D \times D}$.
+
+\paragraph{Fine-to-Coarse (F2C).}
+For $k = 0, 1, \ldots, K{-}1$:
+\begin{equation}
+\tilde{\bm{h}}^{(k+1)}_\text{f2c} = \bm{h}^{(k+1)} + \text{AdaptiveAvgPool}\!\left(W^{(\ell)}_{\text{f2c},k}\, \bm{h}^{(k)},\; S_{k+1}\right)
+\end{equation}
+
+\paragraph{Merge.}
+\begin{equation}
+\bm{h}^{(k)}_\text{out} = \frac{1}{2}\!\left(\tilde{\bm{h}}^{(k)}_\text{c2f} + \tilde{\bm{h}}^{(k)}_\text{f2c}\right)
+\end{equation}
+
+\subsection{Per-Scale Classification and Mixing}
+
+Each scale produces independent logits via a per-scale classifier $g_k$, combined with learnable softmax weights:
+\begin{equation}
+\hat{\bm{y}} = \sum_{k=0}^{K} w_k \cdot g_k(\bm{h}^{(k)}_\text{final}), \quad
+\bm{w} = \softmax(\bm{\alpha}), \quad \bm{\alpha} \in \R^{K+1}
+\end{equation}
+where $\bm{\alpha}$ is a learnable parameter initialized to $\bm{0}$ (uniform mixing at init).
+
+\subsection{Loss Function}
+
+\begin{equation}
+\mL = \mL_\text{CE}(\hat{\bm{y}}, \bm{y})
+\end{equation}
+No auxiliary losses; the contribution is purely architectural.
+
+\subsection{Improved Variant: CrissCross-Aware MSFT}
+
+The improved variant modifies the aggregation to preserve CBraMod's spatial-temporal attention structure:
+
+\paragraph{Independent per-scale processing.} Each scale passes through each frozen transformer layer \emph{independently} (not concatenated), preserving the Criss-Cross Attention pattern.
+
+\paragraph{Positional Refiner.} A depthwise Conv2D with BatchNorm is applied after each scale's patch embedding:
+\begin{equation}
+\text{PosRefine}(\bm{e}) = \bm{e} + \text{BN}\!\left(\text{DWConv2D}(\bm{e})\right), \quad \text{kernel} = 3 \times 3
+\end{equation}
+
+\paragraph{Spatial Fusion.} After temporal C2F/F2C, an additional per-scale spatial fusion:
+\begin{equation}
+\bm{h}^{(k)}_\text{fused} = \bm{h}^{(k)}_\text{agg} + \text{GELU}(W^{(k)}_\text{spatial}\, \bm{h}^{(k)}_\text{agg})
+\end{equation}
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{Multi-Scale Fine-Tuning (MSFT)}
+\begin{algorithmic}[1]
+\REQUIRE Frozen backbone with layers $\{f^{(\ell)}\}_{\ell=1}^L$, $K{+}1$ scales
+\STATE $\{\bx^{(k)}\}_{k=0}^K \leftarrow \text{MultiScaleGenerator}(\bx)$
+\FOR{$k = 0$ to $K$}
+  \STATE $\bm{e}^{(k)} \leftarrow \text{ScaleAdapter}_k\!\left(\text{FrozenPatchEmbed}(\bx^{(k)})\right)$
+\ENDFOR
+\STATE $\bm{h} \leftarrow \text{Concat}(\bm{e}^{(0)}, \ldots, \bm{e}^{(K)})$ along temporal dim
+\FOR{$\ell = 1$ to $L$}
+  \STATE $\bm{h} \leftarrow f^{(\ell)}(\bm{h})$ \COMMENT{Frozen layer}
+  \STATE $\{\bm{h}^{(k)}\} \leftarrow \text{SplitByScale}(\bm{h})$
+  \STATE $\{\bm{h}^{(k)}\} \leftarrow \text{CrossScaleAgg}^{(\ell)}(\{\bm{h}^{(k)}\})$ \COMMENT{Trainable}
+  \STATE $\bm{h} \leftarrow \text{Concat}(\bm{h}^{(0)}, \ldots, \bm{h}^{(K)})$
+\ENDFOR
+\STATE $\{\bm{h}^{(k)}_\text{final}\} \leftarrow \text{SplitByScale}(\bm{h})$
+\STATE $\bm{w} \leftarrow \softmax(\bm{\alpha})$
+\STATE $\hat{\bm{y}} \leftarrow \sum_k w_k \cdot g_k(\bm{h}^{(k)}_\text{final})$
+\STATE $\mL \leftarrow \mL_\text{CE}(\hat{\bm{y}}, \bm{y})$
+\end{algorithmic}
+\end{algorithm}
+
+%=============================================================================
+\section{Method 3: Hyperbolic Fine-Tuning}
+\label{sec:hyperbolic}
+%=============================================================================
+
+\subsection{Overview}
+Inspired by HEEGNet~\cite{li2026heegnet}, this method projects frozen backbone representations onto a Lorentz hyperbolic manifold, enabling hierarchical and domain-invariant feature learning.
+The method combines \emph{hyperbolic multinomial logistic regression} (HMLR) with \emph{domain-specific hyperbolic batch normalization} (DSMDBN) and \emph{Horospherical Sliced-Wasserstein} (HHSW) regularization.
+
+\subsection{Lorentz Manifold}
+
+The Lorentz model of hyperbolic space is defined as:
+\begin{equation}
+\Lo^n_K = \left\{ \bx \in \R^{n+1} \;\middle|\; \inner{\bx}{\bx}_\Lo = \frac{1}{K},\; x_0 > 0 \right\}, \quad K < 0
+\end{equation}
+with the Minkowski inner product:
+\begin{equation}
+\inner{\bm{u}}{\bm{v}}_\Lo = -u_0 v_0 + \sum_{i=1}^{n} u_i v_i
+\end{equation}
+
+The origin is $\bm{o} = \left[\frac{1}{\sqrt{-K}},\, 0, \ldots, 0\right]^\top$.
+The geodesic distance is:
+\begin{equation}
+d_K(\bx, \bm{y}) = \frac{1}{\sqrt{-K}} \acosh\!\left(K \inner{\bx}{\bm{y}}_\Lo\right)
+\end{equation}
+
+\paragraph{Exponential map at origin.}
+\begin{equation}
+\exp_{\bm{o}}(\bm{u}) = \left[\frac{\cosh(\vartheta)}{\sqrt{-K}},\; \frac{\sinh(\vartheta)}{\vartheta} \bm{u}_s \right], \quad
+\vartheta = \sqrt{-K} \|\bm{u}_s\|_2
+\end{equation}
+where $\bm{u}_s = [u_1, \ldots, u_n]$ denotes the spatial components.
+
+\paragraph{Projection to manifold.} Given Euclidean vector $\bm{v} \in \R^n$:
+\begin{equation}
+\text{proj}_K(\bm{v}) = \left[\sqrt{\|\bm{v}\|_2^2 - \frac{1}{K}},\; \bm{v}\right] \in \Lo^n_K
+\end{equation}
+
+\subsection{Architecture}
+
+\paragraph{Hyperbolic Projection.}
+\begin{equation}
+\bm{h}_\text{flat} = \text{flatten}(f_\theta(\bx)) \in \R^{C \cdot S \cdot D}, \quad
+\bm{v} = W_2\, \sigma(W_1\, \bm{h}_\text{flat}) \in \R^{n_\text{hyp}}
+\end{equation}
+\begin{equation}
+\bm{p} = \text{proj}_K\!\left(\frac{\bm{v}}{\|\bm{v}\|_2}\right) \in \Lo^{n_\text{hyp}}_K
+\end{equation}
+
+\paragraph{Lorentz ELU Activation.}
+\begin{equation}
+\text{LorentzELU}(\bx) = \left[\sqrt{\|\text{ELU}(\bx_s)\|_2^2 - \frac{1}{K}},\; \text{ELU}(\bx_s)\right]
+\end{equation}
+
+\paragraph{Domain-Specific Momentum-then-Distribution BN (DSMDBN).}
+For each domain $d$, maintain running Fr\'{e}chet mean $\bar{\bmu}_d$ and variance $\bar{\nu}^2_d$:
+\begin{align}
+\bmu_d^{(t)} &= \text{Fr\'{e}chetMean}\!\left(\{\bx_i : d_i = d\}\right) \\
+\bar{\bmu}_d &\leftarrow \text{geodesic}\!\left(\bar{\bmu}_d,\, \bmu_d^{(t)},\, \eta\right) \\
+\bar{\nu}^2_d &\leftarrow (1 - \eta)\, \bar{\nu}^2_d + \eta\, \nu^{2(t)}_d
+\end{align}
+
+Normalization:
+\begin{equation}
+\tilde{\bx} = \frac{s}{\sqrt{\bar{\nu}^2_d + \epsilon}} \otimes_K \left((\ominus_K \bar{\bmu}_d) \oplus_K \bx\right)
+\end{equation}
+where $s \in \R^+$ is a learnable scale parameter shared across domains.
+The momentum $\eta$ decays during training: $\eta^{(k)} = \max(\eta_\text{min},\, \eta_0 \cdot \rho^k)$, with defaults $\eta_0 = 1.0$, $\rho = 0.99$, $\eta_\text{min} = 0.1$.
+
+\paragraph{Hyperbolic Multinomial Logistic Regression (HMLR).}
+For class $c$ with parameters $a_c \in \R$ (offset) and $\bz_c \in \R^{n}$ (normal vector):
+\begin{align}
+w_t^{(c)} &= \sinh(\sqrt{-K}\, a_c) \cdot \|\bz_c\|_2, \quad
+\bm{w}_s^{(c)} = \cosh(\sqrt{-K}\, a_c) \cdot \bz_c \\
+\beta_c &= \sqrt{-\left(w_t^{(c)}\right)^2 + \|\bm{w}_s^{(c)}\|_2^2} \\
+\alpha_c(\bx) &= -w_t^{(c)}\, x_0 + \cosh(\sqrt{-K}\, a_c) \inner{\bx_s}{\bz_c} \\
+d_c(\bx) &= \sqrt{|K|} \left| \asinh\!\left(\frac{\sqrt{-K}\, \alpha_c(\bx)}{\beta_c}\right) \right| \\
+\text{logit}_c(\bx) &= \sign(\alpha_c(\bx)) \cdot \beta_c \cdot d_c(\bx)
+\end{align}
+
+\subsection{Loss Function}
+
+\begin{equation}
+\mL = \mL_\text{CE}(\hat{\bm{y}}, \bm{y}) + \lambda_\text{HHSW} \cdot \mL_\text{HHSW}
+\end{equation}
+
+\paragraph{HHSW (Horospherical Sliced-Wasserstein).}
+For domain $d$ with features $\mathcal{P}_d = \{\bx_i : d_i = d\}$ and reference distribution $\mathcal{Q}$ (Gaussian mapped to $\Lo^n_K$ via $\exp_{\bm{o}}$):
+\begin{equation}
+\mL_\text{HHSW} = \sum_d \frac{1}{J} \sum_{j=1}^{J} W_2^2\!\left(\text{sort}(B_{\bm{v}_j}(\mathcal{P}_d)),\; \text{sort}(B_{\bm{v}_j}(\mathcal{Q}))\right)
+\end{equation}
+where $J = 1000$ random projections, $B_{\bm{v}}(\bz) = \log\!\left(-\inner{\bm{v} + \bm{o}}{\bz}_\Lo\right)$ is the Busemann function, and $W_2^2$ is the squared 1D Wasserstein-2 distance computed via sorted CDFs.
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{Hyperbolic Fine-Tuning}
+\begin{algorithmic}[1]
+\REQUIRE Frozen backbone $f_\theta$, modules $\{\text{HypProj}, \text{DSMDBN}, \text{HMLR}\}$
+\FOR{each mini-batch $(\bx, \bm{y}, \bm{d})$}
+  \STATE $\bm{H} \leftarrow f_\theta(\bx)$ \COMMENT{Frozen, no\_grad (unless adapters)}
+  \STATE $\bm{h} \leftarrow \text{flatten}(\bm{H})$
+  \STATE $\bm{p} \leftarrow \text{HypProj}(\bm{h})$ \COMMENT{$\R^d \to \Lo^n_K$}
+  \STATE $\bm{p} \leftarrow \text{LorentzELU}(\bm{p})$
+  \STATE $\tilde{\bm{p}} \leftarrow \text{DSMDBN}(\bm{p}, \bm{d})$ \COMMENT{Domain-specific BN}
+  \STATE $\hat{\bm{y}} \leftarrow \text{HMLR}(\tilde{\bm{p}})$ \COMMENT{Hyperbolic classifier}
+  \STATE $\mL \leftarrow \mL_\text{CE}(\hat{\bm{y}}, \bm{y}) + \lambda \cdot \mL_\text{HHSW}(\tilde{\bm{p}}, \bm{d})$
+  \STATE Update trainable params via $\nabla \mL$ (RiemannianAdam)
+  \STATE $\eta \leftarrow \max(\eta_\text{min},\, \eta \cdot \rho)$ \COMMENT{Momentum decay}
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Optimizer}
+
+Three parameter groups:
+\begin{enumerate}
+\item \textbf{Hyperbolic params} (HMLR, DSMDBN, LorentzELU): weight decay $= 0$
+\item \textbf{Euclidean params} (HyperbolicProjection): weight decay $= 10^{-3}$
+\item \textbf{Adapter params} (if CBraMod adapters): $\text{lr} = 0.1 \times \text{lr}_\text{base}$
+\end{enumerate}
+Optimizer: RiemannianAdam (via \texttt{geoopt}), fallback to Adam. Default $\text{lr} = 10^{-3}$.
+
+%=============================================================================
+\section{Method 4: MI Fine-Tuning (VIB + InfoNCE)}
+\label{sec:mi}
+%=============================================================================
+
+\subsection{Overview}
+
+This method combines two information-theoretic objectives with standard classification:
+\begin{itemize}
+\item \textbf{Variational Information Bottleneck (VIB):} Compress backbone representations to suppress subject-specific noise by minimizing $I(\bm{Z}; \bm{X})$ while maximizing $I(\bm{Z}; Y)$.
+\item \textbf{InfoNCE:} Align backbone representations with expert-crafted EEG features (PSD, statistics) to maximize $I(\bm{Z}_\text{FM}; \bm{Z}_\text{expert})$.
+\end{itemize}
+
+\subsection{Architecture}
+
+\paragraph{Representation Projection.}
+\begin{equation}
+\bm{Z}_\text{FM} = W_2\, \sigma(W_1\, \text{flatten}(\bm{H})) \in \R^{B \times H}, \quad H = 256
+\end{equation}
+where $\sigma = \text{GELU} \circ \text{Dropout}$.
+
+\paragraph{VIB Layer.} Parameterizes $q(\bz | \bm{Z}_\text{FM}) = \mN(\bmu, \diag(\bsigma^2))$:
+\begin{align}
+\bmu &= f_\mu(\bm{Z}_\text{FM}) \in \R^{B \times V}, \quad
+\log \bsigma^2 = \text{clamp}(f_{\log\sigma^2}(\bm{Z}_\text{FM}),\, {-10},\, 10) \\
+\bz &= \bmu + \bsigma \odot \bm{\epsilon}, \quad \bm{\epsilon} \sim \mN(0, \bm{I}) \quad \text{(training)}
+\end{align}
+where $V = 128$ is the VIB dimension. In eval mode, $\bz = \bmu$.
+
+\paragraph{Classifier Head.}
+\begin{equation}
+\hat{\bm{y}} = W_4\, \sigma(W_3\, \bz) \in \R^{B \times N_\text{cls}}
+\end{equation}
+with BatchNorm between layers.
+
+\paragraph{Contrastive Head.}
+\begin{equation}
+\bz_\text{fm} = \frac{h_\text{contrast}(\bm{Z}_\text{FM})}{\|h_\text{contrast}(\bm{Z}_\text{FM})\|_2} \in \R^{B \times H}
+\end{equation}
+
+\paragraph{Expert Feature Extractor.}
+Computes expert features $\bm{x}_\text{exp} \in \R^{B \times E}$ from raw EEG:
+\begin{itemize}
+\item \textbf{PSD}: FFT-based power in 5 bands ($\delta$: 0.5--4Hz, $\theta$: 4--8Hz, $\alpha$: 8--13Hz, $\beta$: 13--30Hz, $\gamma$: 30--50Hz), $\log(1 + \text{PSD})$ transformed. $E = 5C$.
+\item \textbf{Statistics}: Mean, std, min, max per channel. $E = 4C$.
+\item \textbf{Both}: Concatenation. $E = 9C$.
+\end{itemize}
+
+\paragraph{Expert Projector.}
+\begin{equation}
+\bz_\text{exp} = \frac{h_\text{expert}(\bm{x}_\text{exp})}{\|h_\text{expert}(\bm{x}_\text{exp})\|_2} \in \R^{B \times H}
+\end{equation}
+
+\subsection{Loss Function}
+
+\begin{equation}
+\mL = \mL_\text{CE}(\hat{\bm{y}}, \bm{y}) + \beta \cdot \mL_\text{VIB} + \alpha \cdot \mL_\text{InfoNCE}
+\end{equation}
+
+\paragraph{VIB Loss (KL divergence).}
+\begin{equation}
+\mL_\text{VIB} = \KL\!\left[q(\bz|\bx) \,\|\, p(\bz)\right] = -\frac{1}{2B} \sum_{i=1}^{B} \sum_{j=1}^{V} \left(1 + \log\sigma^2_{ij} - \mu^2_{ij} - \sigma^2_{ij}\right)
+\end{equation}
+
+\paragraph{Symmetric InfoNCE.}
+\begin{equation}
+\mL_\text{InfoNCE} = \frac{1}{2}\!\left[\mL_\text{NCE}(\bz_\text{fm} \to \bz_\text{exp}) + \mL_\text{NCE}(\bz_\text{exp} \to \bz_\text{fm})\right]
+\end{equation}
+where
+\begin{equation}
+\mL_\text{NCE}(\bm{A} \to \bm{B}) = -\frac{1}{B} \sum_{i=1}^{B} \log \frac{\exp(\bm{a}_i^\top \bm{b}_i / \tau)}{\sum_{j=1}^{B} \exp(\bm{a}_i^\top \bm{b}_j / \tau)}
+\end{equation}
+with temperature $\tau = 0.07$.
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{MI Fine-Tuning (VIB + InfoNCE)}
+\begin{algorithmic}[1]
+\REQUIRE Frozen backbone $f_\theta$, MIFineTuner, ExpertExtractor
+\FOR{each mini-batch $(\bx, \bm{y})$}
+  \STATE $\bm{H} \leftarrow f_\theta(\bx)$ \COMMENT{Frozen backbone}
+  \STATE $\bm{Z}_\text{FM} \leftarrow \text{RepProj}(\text{flatten}(\bm{H}))$
+  \STATE $\bz, \bmu, \log\bsigma^2 \leftarrow \text{VIB}(\bm{Z}_\text{FM})$ \COMMENT{Reparameterize}
+  \STATE $\hat{\bm{y}} \leftarrow \text{Classifier}(\bz)$
+  \STATE $\bz_\text{fm} \leftarrow \ell_2\text{-norm}(\text{ContrastHead}(\bm{Z}_\text{FM}))$
+  \STATE $\bm{x}_\text{exp} \leftarrow \text{ExpertExtract}(\bx)$ \COMMENT{PSD / stats}
+  \STATE $\bz_\text{exp} \leftarrow \ell_2\text{-norm}(\text{ExpertProj}(\bm{x}_\text{exp}))$
+  \STATE $\mL \leftarrow \mL_\text{CE} + \beta \cdot \mL_\text{VIB}(\bmu, \log\bsigma^2) + \alpha \cdot \mL_\text{InfoNCE}(\bz_\text{fm}, \bz_\text{exp})$
+  \STATE Update trainable params via $\nabla \mL$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Default Hyperparameters}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Parameter & Symbol & Default \\
+\midrule
+Hidden dimension & $H$ & 256 \\
+VIB dimension & $V$ & 128 \\
+InfoNCE weight & $\alpha$ & 1.0 \\
+VIB weight & $\beta$ & $10^{-3}$ \\
+Temperature & $\tau$ & 0.07 \\
+Expert features & -- & PSD (5 bands) \\
+Optimizer & -- & AdamW \\
+Learning rate & -- & $10^{-3}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Method 5: Information Bottleneck + Disentanglement}
+\label{sec:ib}
+%=============================================================================
+
+\subsection{Overview}
+
+This method extends the information-theoretic approach with two key innovations over Method~4:
+\begin{enumerate}
+\item \textbf{Token-level IB}: Applies the information bottleneck at the per-token level (preserving spatial-temporal structure) rather than after global flattening.
+\item \textbf{Gradient Reversal Layer (GRL)}: Explicitly minimizes $I(\bm{Z}; \text{Subject})$ via adversarial training, eliminating the need for hand-crafted expert features.
+\end{enumerate}
+
+\subsection{Architecture}
+
+\paragraph{Token-Level IB Adapter.}
+The backbone output $\bm{H} \in \R^{B \times C \times S \times D}$ is reshaped to $\bm{H} \in \R^{B \times T \times D}$ with $T = C \times S$.
+A shared encoder produces per-token variational parameters:
+\begin{align}
+\bm{e}_t &= \sigma(\text{LN}(W_\text{enc}\, \bm{h}_t)) \in \R^{D}, \quad \forall t \in \{1, \ldots, T\} \\
+\bmu_t &= W_\mu\, \bm{e}_t \in \R^{D'}, \quad
+\log\bsigma^2_t = \text{clamp}(W_{\log\sigma^2}\, \bm{e}_t,\, {-10},\, 10) \\
+\bz_t &= \bmu_t + \bsigma_t \odot \bm{\epsilon}_t, \quad \bm{\epsilon}_t \sim \mN(0, \bm{I})
+\end{align}
+where $D' = 128$ (latent dimension), $\sigma = \text{GELU} \circ \text{Dropout}$, and LN denotes LayerNorm.
+
+\paragraph{Aggregation.}
+\begin{equation}
+\bz_\text{agg} = \frac{1}{T} \sum_{t=1}^{T} \bz_t \in \R^{D'}
+\end{equation}
+
+\paragraph{Disease Classifier.}
+\begin{equation}
+\hat{\bm{y}}_\text{disease} = g_\text{disease}(\bz_\text{agg}) \in \R^{N_\text{cls}}
+\end{equation}
+
+\paragraph{Gradient Reversal Layer.}
+\begin{equation}
+\text{GRL}_\lambda(\bz) \triangleq \bz, \quad
+\frac{\partial \text{GRL}_\lambda}{\partial \bz} = -\lambda \cdot \bm{I}
+\end{equation}
+Identity in forward pass, negated and scaled gradients in backward pass.
+
+\paragraph{Subject Classifier.}
+\begin{equation}
+\hat{\bm{y}}_\text{subject} = g_\text{subject}(\text{GRL}_\lambda(\bz_\text{agg})) \in \R^{N_\text{subj}}
+\end{equation}
+
+\subsection{Loss Function}
+
+\begin{equation}
+\mL = \mL_\text{task} + \beta \cdot \mL_\text{IB} + \lambda_\text{adv} \cdot \mL_\text{MI}
+\end{equation}
+
+\paragraph{Task Loss.}
+$\mL_\text{task} = \mL_\text{CE}(\hat{\bm{y}}_\text{disease}, \bm{y})$ or $\mL_\text{BCE}$ for binary tasks.
+
+\paragraph{Token-Level IB Loss.}
+\begin{equation}
+\mL_\text{IB} = -\frac{1}{2BT} \sum_{i=1}^{B} \sum_{t=1}^{T} \sum_{j=1}^{D'} \left(1 + \log\sigma^2_{i,t,j} - \mu^2_{i,t,j} - \sigma^2_{i,t,j}\right)
+\end{equation}
+Compared to Method~4's VIB (averaged over $B$), this averages over $B \times T$, giving per-token compression.
+
+\paragraph{Adversarial MI Loss.}
+\begin{equation}
+\mL_\text{MI} = \mL_\text{CE}(\hat{\bm{y}}_\text{subject}, \bm{s})
+\end{equation}
+where $\bm{s}$ are subject labels. The GRL ensures that minimizing $\mL_\text{MI}$ w.r.t.\ the subject head simultaneously \emph{maximizes} $\mL_\text{MI}$ w.r.t.\ the encoder and IB adapter --- no alternating min-max required.
+
+\subsection{GRL Lambda Schedule}
+
+The adversarial pressure ramps up during training via a sigmoid schedule:
+\begin{equation}
+\lambda(p) = \frac{2}{1 + \exp(-\gamma \cdot p)} - 1, \quad p = \frac{\text{epoch}}{\text{total\_epochs}}
+\end{equation}
+with $\gamma = 10$, ramping from $\lambda \approx 0$ to $\lambda \approx 1$.
+
+\subsection{Interpretability: Information Retention Heatmap}
+
+The per-token KL divergence provides a natural measure of \emph{how much information} each spatial-temporal token retains after compression:
+\begin{equation}
+\text{KL}_t = -\frac{1}{2} \sum_{j=1}^{D'} \left(1 + \log\sigma^2_{t,j} - \mu^2_{t,j} - \sigma^2_{t,j}\right)
+\end{equation}
+Reshaped to $(C, S)$, this yields a spatial-temporal heatmap.
+Channel importance: $\text{CI}_c = \frac{1}{S}\sum_s \text{KL}_{c,s}$.
+Temporal importance: $\text{TI}_s = \frac{1}{C}\sum_c \text{KL}_{c,s}$.
+
+\subsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{IB + Disentanglement Fine-Tuning}
+\begin{algorithmic}[1]
+\REQUIRE Frozen backbone $f_\theta$, IB Adapter, Disease Head, GRL, Subject Head
+\FOR{each epoch $e$}
+  \STATE $\lambda \leftarrow 2/(1 + \exp(-\gamma \cdot e / E)) - 1$ \COMMENT{Update GRL}
+  \FOR{each mini-batch $(\bx, \bm{y}, \bm{s})$}
+    \STATE $\bm{H} \leftarrow \text{reshape}(f_\theta(\bx),\, [B, T, D])$ \COMMENT{Frozen backbone}
+    \STATE $\bm{Z}, \bmu, \log\bsigma^2 \leftarrow \text{IB\_Adapter}(\bm{H})$ \COMMENT{Token-level}
+    \STATE $\bz_\text{agg} \leftarrow \text{mean}(\bm{Z}, \text{dim}=1)$
+    \STATE $\hat{\bm{y}} \leftarrow g_\text{disease}(\bz_\text{agg})$
+    \STATE $\hat{\bm{s}} \leftarrow g_\text{subject}(\text{GRL}_\lambda(\bz_\text{agg}))$
+    \STATE $\mL \leftarrow \mL_\text{CE}(\hat{\bm{y}}, \bm{y}) + \beta \cdot \mL_\text{IB}(\bmu, \log\bsigma^2) + \lambda_\text{adv} \cdot \mL_\text{CE}(\hat{\bm{s}}, \bm{s})$
+    \STATE Clip gradients: $\|\nabla\| \leq 5.0$
+    \STATE Update trainable params via $\nabla \mL$
+  \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Optimizer}
+
+Four parameter groups with AdamW:
+\begin{enumerate}
+\item \textbf{IB Adapter}: $\text{lr} = \text{lr}_\text{base}$
+\item \textbf{Disease Head}: $\text{lr} = \text{lr}_\text{base}$
+\item \textbf{Subject Head}: $\text{lr} = 2 \times \text{lr}_\text{base}$ (faster adversarial learning)
+\item \textbf{Backbone Adapters} (if present): $\text{lr} = 0.1 \times \text{lr}_\text{base}$
+\end{enumerate}
+
+%=============================================================================
+\section{Shared Infrastructure: Backbone Factory with Adapters}
+\label{sec:factory}
+%=============================================================================
+
+\subsection{Bottleneck Adapter}
+
+For CBraMod with inter-layer adapter injection, we insert a lightweight residual bottleneck after each frozen transformer layer:
+\begin{equation}
+\text{Adapter}(\bm{h}) = \bm{h} + W_\text{up}\, \text{GELU}(W_\text{down}\, \bm{h})
+\end{equation}
+where $W_\text{down} \in \R^{(D/r) \times D}$, $W_\text{up} \in \R^{D \times (D/r)}$ with reduction factor $r = 4$ (default), giving $D/r = 50$.
+
+\paragraph{Zero initialization.} $W_\text{up}$ and its bias are initialized to zero, so the adapter acts as an identity function at initialization, preserving pretrained features.
+
+\paragraph{Parameters per adapter:} $D \cdot (D/r) + (D/r) + (D/r) \cdot D + D = 2D(D/r) + D + D/r \approx 20{,}250$ for $D=200, r=4$.
+With 12 layers: $\sim$243K total adapter parameters.
+
+\subsection{Forward Pass Comparison}
+
+\paragraph{HEAD-ONLY (default).}
+\begin{equation}
+\bx \xrightarrow{\text{frozen}} f_\theta(\bx) \xrightarrow{\text{trainable}} \text{Head}(\cdot) \to \hat{\bm{y}}
+\end{equation}
+
+\paragraph{INTER-LAYER (with adapters).}
+\begin{equation}
+\bx \xrightarrow{\text{frozen PE}} \bm{e} \xrightarrow[\text{adapter}_1]{\text{frozen layer}_1} \cdots \xrightarrow[\text{adapter}_L]{\text{frozen layer}_L} \bm{h} \xrightarrow{\text{trainable}} \text{Head}(\cdot) \to \hat{\bm{y}}
+\end{equation}
+
+%=============================================================================
+\section{Ablation Configurations}
+\label{sec:ablation}
+%=============================================================================
+
+\subsection{IB + Disentanglement Ablations}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Configuration & $\beta$ (IB) & $\lambda_\text{adv}$ (GRL) & Description \\
+\midrule
+\texttt{full\_ib\_adv} & $10^{-3}$ & 0.5 & Full model \\
+\texttt{ib\_only} & $10^{-3}$ & 0.0 & IB without adversarial \\
+\texttt{adv\_only} & 0.0 & 0.5 & Adversarial without IB \\
+\texttt{baseline\_ce} & 0.0 & 0.0 & CE only (head-only baseline) \\
+\texttt{high\_beta} & $10^{-2}$ & 0.5 & Stronger compression \\
+\texttt{low\_beta} & $10^{-4}$ & 0.5 & Weaker compression \\
+\texttt{high\_lambda} & $10^{-3}$ & 1.0 & Stronger disentanglement \\
+\texttt{low\_lambda} & $10^{-3}$ & 0.1 & Weaker disentanglement \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{MSFT Scale Ablations}
+
+Number of scales $K+1 \in \{1, 2, 3, 4\}$, tested across datasets (TUEV, TUAB).
+
+%=============================================================================
+\section{Comparison Summary}
+\label{sec:comparison}
+%=============================================================================
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}p{2.0cm}p{3.8cm}p{2.5cm}p{2.2cm}p{2.5cm}@{}}
+\toprule
+Method & Loss & Trainable Modules & Backbone Mode & Key Innovation \\
+\midrule
+Baseline & $\mL_\text{CE}$ & Backbone + Classifier & Full FT / Frozen & -- \\
+\addlinespace
+MSFT & $\mL_\text{CE}$ & ScaleAdapters, CrossScaleAggs, Classifiers & Frozen (inter-layer) & Multi-scale C2F/F2C aggregation \\
+\addlinespace
+Hyperbolic & $\mL_\text{CE} + \lambda \mL_\text{HHSW}$ & HypProj, DSMDBN, HMLR & Frozen (head-only) & Lorentz manifold, domain BN \\
+\addlinespace
+MI (VIB+NCE) & $\mL_\text{CE} + \beta \mL_\text{VIB} + \alpha \mL_\text{NCE}$ & RepProj, VIB, Contrast, ExpertProj, Classifier & Frozen (head-only) & Expert-guided contrastive + VIB \\
+\addlinespace
+IB+Disentangle & $\mL_\text{task} + \beta \mL_\text{IB} + \lambda \mL_\text{MI}$ & IB Adapter, Disease Head, Subject Head & Frozen (head-only) & Token-level IB, GRL adversarial \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of all fine-tuning methods. All methods except baseline keep the backbone frozen. Methods 3--5 support optional CBraMod inter-layer adapters via the Backbone Factory.}
+\end{table}
+
+%=============================================================================
+\section{Supported Backbones and Datasets}
+\label{sec:support}
+%=============================================================================
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+ & Baseline & MSFT & Hyperbolic & MI & IB+Disentangle \\
+\midrule
+CodeBrain (SSSM) & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+CBraMod & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+CBraMod + Adapters & -- & -- & \checkmark & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\caption{Backbone support matrix across methods.}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Dataset & Task & Classes & Channels & Sampling & Duration & Patch Size \\
+\midrule
+TUEV & Multiclass & 6 & 16 & 200\,Hz & 5\,s & 200 \\
+TUAB & Binary & 2 & 16 & 200\,Hz & 10\,s & 200 \\
+CHB-MIT & Binary & 2 & 16 & 256\,Hz & 5\,s & 200 \\
+TUSZ & Binary & 2 & 22 & 200\,Hz & 5\,s & 200 \\
+DIAGNOSIS & Multiclass & 4 & 58 & 250\,Hz & 1\,s & 200 \\
+DEPRESSION & Binary & 2 & 63 & 200\,Hz & 5\,s & 200 \\
+\bottomrule
+\end{tabular}
+\caption{Supported EEG datasets with configurations.}
+\end{table}
+
+\begin{thebibliography}{9}
+\bibitem{qiao2025msft}
+Qiao et al.
+\newblock Multi-Scale Finetuning for Encoder-based Time Series Foundation Models.
+\newblock 2025.
+
+\bibitem{li2026heegnet}
+Li et al.
+\newblock HEEGNet: Hyperbolic EEG Foundation Model.
+\newblock 2026.
+
+\bibitem{alemi2017deep}
+Alemi, A.~A., Fischer, I., Dillon, J.~V., and Murphy, K.
+\newblock Deep variational information bottleneck.
+\newblock In \emph{ICLR}, 2017.
+
+\bibitem{ganin2016domain}
+Ganin, Y. et al.
+\newblock Domain-adversarial training of neural networks.
+\newblock \emph{JMLR}, 17(1):2096--2030, 2016.
+
+\bibitem{houlsby2019parameter}
+Houlsby, N. et al.
+\newblock Parameter-efficient transfer learning for NLP.
+\newblock In \emph{ICML}, 2019.
+
+\bibitem{oord2018representation}
+van den Oord, A., Li, Y., and Vinyals, O.
+\newblock Representation learning with contrastive predictive coding.
+\newblock \emph{arXiv preprint arXiv:1807.03748}, 2018.
+\end{thebibliography}
+
+\end{document}

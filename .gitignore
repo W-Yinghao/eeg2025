@@ -1,0 +1,89 @@
+# =============================================
+# Only track NIPS/ and NIPS_finetune/ directories
+# =============================================
+
+# Ignore everything at the top level
+/*
+# But not these
+!.gitignore
+!NIPS/
+!NIPS_finetune/
+
+# =============================================
+# Model weights and checkpoints
+# =============================================
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.h5
+*.bin
+
+# =============================================
+# Data files
+# =============================================
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.parquet
+*.feather
+*.hdf5
+*.mat
+*.edf
+*.bdf
+*.fif
+
+# =============================================
+# Archives
+# =============================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# =============================================
+# Large CSVs (data files)
+# =============================================
+*.csv
+
+# =============================================
+# Directories to ignore
+# =============================================
+__pycache__/
+*.pyc
+wandb/
+*.wandb
+.ipynb_checkpoints/
+**/datasets/
+**/outputs/
+**/checkpoints*/
+
+# Embedded git repos - exclude their .git dirs
+NIPS_finetune/BioFoundation/.git/
+NIPS/HEEGNet/.git/
+NIPS/CBraMod/.git/
+NIPS/CodeBrain/.git/
+
+# PDF files
+*.pdf
+
+# Log files
+*.log
+*.out
+**/slurm_log/
+**/logs_*/
+**/logs/
+
+# =============================================
+# OS / IDE
+# =============================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
