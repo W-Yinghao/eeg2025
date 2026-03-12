@@ -178,7 +178,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'CodeBrain'))
 from Models.SSSM import SSSM
 
 # Add BioFoundation to path (for FEMBA and LUNA models)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'BioFoundation'))
+# Temporarily swap out CBraMod's 'models' from sys.modules so BioFoundation's 'models' can be imported
+_biofound_path = os.path.join(os.path.dirname(__file__), 'BioFoundation')
+sys.path.insert(0, _biofound_path)
+_saved_models = {k: v for k, v in sys.modules.items() if k == 'models' or k.startswith('models.')}
+for k in _saved_models:
+    del sys.modules[k]
+
 try:
     from models.FEMBA import FEMBA
     FEMBA_AVAILABLE = True
@@ -192,6 +198,13 @@ try:
 except ImportError as e:
     LUNA_AVAILABLE = False
     print(f"Warning: LUNA not available ({e}). Install timm and rotary-embedding-torch.")
+
+# Restore CBraMod's 'models' modules and remove BioFoundation from path
+_biofound_modules = {k: v for k, v in sys.modules.items() if k == 'models' or k.startswith('models.')}
+for k in _biofound_modules:
+    del sys.modules[k]
+sys.modules.update(_saved_models)
+sys.path.remove(_biofound_path)
 
 # Try to import wandb
 try:
@@ -267,12 +280,12 @@ DATASET_CONFIGS = {
         'splits': {'train': 'train', 'val': 'dev', 'test': 'eval'},
     },
     'DIAGNOSIS': {
-        'data_dir': '/projects/EEG-foundation-model/diagnosis_data_lmdb',
+        'data_dir': '/projects/EEG-foundation-model/diagnosis_data_lmdb——5s',
         'num_classes': 4,
         'task_type': 'multiclass',
         'n_channels': 58,
-        'sampling_rate': 250,
-        'segment_duration': 1,  # seconds
+        'sampling_rate': 200,  # Resampled to 200Hz (matching patch_size=200)
+        'segment_duration': 5,  # seconds (seq_len=5, matching TUEV/AD_DIAGNOSIS)
         'patch_size': 200,
         'label_names': {
             0: 'normal',
@@ -292,6 +305,7 @@ DATASET_CONFIGS = {
         'train_ratio': 0.7,
         'val_ratio': 0.15,
         'test_ratio': 0.15,
+        'cross_subject': True,  # Enable cross-subject split by default
     },
     'DEPRESSION': {
         'data_dir': '/projects/EEG-foundation-model/diagnosis_data/depression_normal_preprocessed_CBramod',
@@ -1457,7 +1471,7 @@ class LUNAModel(nn.Module):
 
         # Map task type to LUNA num_classes
         if task_type == 'binary':
-            luna_num_classes = 2  # LUNA uses softmax, not sigmoid for binary
+            luna_num_classes = 1  # Binary: single logit for BCEWithLogitsLoss
         else:
             luna_num_classes = num_classes
 

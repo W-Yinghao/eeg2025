@@ -57,4 +57,49 @@
 741609 run_ib.sh cbramod TUEV batch1
 741615 run_ib.sh cbramod TUEV batch2
 
+#######03/11########
+748105 run_full_finetune.sh cbramod TUEV
+748106 run_full_finetune.sh cbramod TUAB
+748107 run_full_finetune.sh cbramod TUSZ
+748108 run_full_finetune.sh cbramod DIAGNOSIS
 
+748109 run_full_finetune.sh codebrain TUEV
+748110 run_full_finetune.sh codebrain TUAB
+748111 run_full_finetune.sh codebrain TUSZ
+748112 run_full_finetune.sh codebrain DIAGNOSIS
+
+748114 run_full_finetune.sh luna TUEV
+748115 run_full_finetune.sh luna TUAB
+748116 run_full_finetune.sh luna TUSZ
+748117 run_full_finetune.sh luna DIAGNOSIS
+
+
+TODO
+
+Full USBA with WandB:
+
+
+conda run -n eeg2025 python train_usba.py \
+    --dataset AD_DIAGNOSIS --model cbramod --usba \
+    --usba_latent_dim 64 --usba_beta 1e-4 \
+    --usba_lambda_cc 0.01 --usba_eta_budget 1e-3 \
+    --wandb_project eeg_usba --cuda 0
+
+Ablation: no factorization:
+
+
+conda run -n eeg2025 python train_usba.py \
+    --dataset TUEV --model cbramod --usba --usba_no_factorize --cuda 0
+
+Ablation: no cc-inv:
+
+
+conda run -n eeg2025 python train_usba.py \
+    --dataset TUEV --model cbramod --usba --usba_no_cc_inv --cuda 0
+
+4. Remaining TODOs
+BILO: Interface reserved in bottleneck.py and injection.py; needs rank-gated LoRA implementation
+SPCBA: Interface reserved; needs dual-latent (z_d/z_s) split in bottleneck
+Per-layer beta schedule: Config field exists, not yet tied to a schedule function
+Class weights: Config supports it, but auto-computation from dataset not yet wired
+DDP: Code is single-GPU; USBAInjectedModel is compatible with nn.DataParallel

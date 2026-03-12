@@ -6,16 +6,13 @@
 #SBATCH --mem 100G
 
 ################################################################################
-# Full Fine-Tuning Baseline: CBraMod / CodeBrain / LUNA
-#
-# All backbone + classifier parameters are trainable (no --linear_probe).
-# Pretrained weights are auto-selected by finetune_tuev_lmdb.py based on --model.
+# USBA Fine-Tuning: CBraMod / CodeBrain / LUNA
 #
 # Usage:
-#   ./run_full_finetune.sh                      # All models x all datasets
-#   ./run_full_finetune.sh codebrain            # CodeBrain on all datasets
-#   ./run_full_finetune.sh cbramod TUEV         # CBraMod on TUEV only
-#   ./run_full_finetune.sh all TUAB             # All models on TUAB only
+#   ./run_usba.sh                      # All models x all datasets
+#   ./run_usba.sh codebrain            # CodeBrain on all datasets
+#   ./run_usba.sh cbramod TUEV         # CBraMod on TUEV only
+#   ./run_usba.sh all DIAGNOSIS        # All models on DIAGNOSIS only
 ################################################################################
 
 set -e
@@ -29,26 +26,27 @@ conda activate eeg2025
 # ============================================================================
 
 PROJECT_DIR="/home/infres/yinwang/eeg2025/NIPS_finetune"
-PYTHON_SCRIPT="${PROJECT_DIR}/finetune_tuev_lmdb.py"
-LOG_DIR="${PROJECT_DIR}/logs_full_finetune"
-CHECKPOINT_DIR="${PROJECT_DIR}/checkpoints_full_finetune"
+PYTHON_SCRIPT="${PROJECT_DIR}/train_usba.py"
+LOG_DIR="${PROJECT_DIR}/logs_usba"
+CHECKPOINT_DIR="${PROJECT_DIR}/checkpoints_usba"
 
 # WandB
-WANDB_PROJECT="finetune_baseline"
+WANDB_PROJECT="eeg_usba"
 
 # GPU
 CUDA_DEVICE=0
 
 # Shared training parameters
-EPOCHS=50
-CLIP_VALUE=1.0
-LABEL_SMOOTHING=0.1
+EPOCHS=100
+CLIP_VALUE=5.0
 SEED=3407
-CLASSIFIER="all_patch_reps"
+PATIENCE=15
 
-# t-SNE
-TSNE_INTERVAL=10
-TSNE_SAMPLES=2000
+# USBA parameters
+USBA_LATENT_DIM=64
+USBA_BETA=1e-4
+USBA_LAMBDA_CC=0.01
+USBA_ETA_BUDGET=1e-3
 
 # ============================================================================
 # Models
@@ -66,26 +64,26 @@ LUNA_SIZE="base"
 # ============================================================================
 
 # TUEV: 6-class, 5s segments
-TUEV_LR=2e-5
-TUEV_WEIGHT_DECAY=5e-4
-TUEV_DROPOUT=0.3
+TUEV_LR=1e-3
+TUEV_WEIGHT_DECAY=1e-3
+TUEV_DROPOUT=0.1
 TUEV_BATCH_SIZE=64
 
 # TUAB: binary, 10s segments
-TUAB_LR=1e-5
-TUAB_WEIGHT_DECAY=5e-5
-TUAB_DROPOUT=0.4
-TUAB_BATCH_SIZE=512
+TUAB_LR=1e-3
+TUAB_WEIGHT_DECAY=1e-3
+TUAB_DROPOUT=0.1
+TUAB_BATCH_SIZE=64
 
 # TUSZ: binary seizure detection, 22ch, 5s segments
-TUSZ_LR=2e-5
-TUSZ_WEIGHT_DECAY=5e-4
-TUSZ_DROPOUT=0.3
+TUSZ_LR=1e-3
+TUSZ_WEIGHT_DECAY=1e-3
+TUSZ_DROPOUT=0.1
 TUSZ_BATCH_SIZE=64
 
-# DIAGNOSIS: 4-class disease classification, 58ch, 1s segments
-DIAGNOSIS_LR=1e-4
-DIAGNOSIS_WEIGHT_DECAY=0.05
+# DIAGNOSIS: 4-class disease classification, 58ch, 5s segments
+DIAGNOSIS_LR=1e-3
+DIAGNOSIS_WEIGHT_DECAY=1e-3
 DIAGNOSIS_DROPOUT=0.1
 DIAGNOSIS_BATCH_SIZE=64
 
@@ -116,14 +114,15 @@ run_experiment() {
     local batch_size=$(get_dataset_param "${dataset}" "BATCH_SIZE")
 
     local timestamp=$(date +"%Y%m%d_%H%M%S")
-    local run_name="FT_${model}_${dataset}_lr${lr}_${timestamp}"
+    local run_name="USBA_${model}_${dataset}_${timestamp}"
     local log_file="${LOG_DIR}/${run_name}.log"
 
     echo ""
     echo "======================================================================"
-    echo "Full Fine-Tune: ${model} / ${dataset}"
+    echo "USBA: ${model} / ${dataset}"
     echo "======================================================================"
     echo "  LR: ${lr}  WD: ${weight_decay}  Dropout: ${dropout}  BS: ${batch_size}"
+    echo "  USBA: latent=${USBA_LATENT_DIM} beta=${USBA_BETA} lambda_cc=${USBA_LAMBDA_CC} eta=${USBA_ETA_BUDGET}"
     echo "  Log: ${log_file}"
     echo "----------------------------------------------------------------------"
 
@@ -131,7 +130,7 @@ run_experiment() {
     local model_args=""
     case "${model}" in
         codebrain)
-            model_args="--n_layer ${CODEBRAIN_N_LAYER} --no_multi_lr"
+            model_args="--n_layer ${CODEBRAIN_N_LAYER}"
             ;;
         luna)
             model_args="--luna_size ${LUNA_SIZE}"
@@ -151,12 +150,14 @@ run_experiment() {
         --lr ${lr} \
         --weight_decay ${weight_decay} \
         --clip_value ${CLIP_VALUE} \
-        --label_smoothing ${LABEL_SMOOTHING} \
         --dropout ${dropout} \
-        --classifier ${CLASSIFIER} \
-        --model_dir ${CHECKPOINT_DIR} \
-        --tsne_interval ${TSNE_INTERVAL} \
-        --tsne_samples ${TSNE_SAMPLES} \
+        --patience ${PATIENCE} \
+        --save_dir ${CHECKPOINT_DIR} \
+        --usba \
+        --usba_latent_dim ${USBA_LATENT_DIM} \
+        --usba_beta ${USBA_BETA} \
+        --usba_lambda_cc ${USBA_LAMBDA_CC} \
+        --usba_eta_budget ${USBA_ETA_BUDGET} \
         --wandb_project ${WANDB_PROJECT} \
         --wandb_run_name ${run_name} \
         ${model_args}"
@@ -198,7 +199,7 @@ main() {
 
     local total=$(( ${#models[@]} * ${#datasets[@]} ))
     echo "======================================================================"
-    echo "Full Fine-Tuning Baseline"
+    echo "USBA Fine-Tuning"
     echo "======================================================================"
     echo "  Models:   ${models[*]}"
     echo "  Datasets: ${datasets[*]}"
@@ -238,10 +239,9 @@ show_usage() {
     echo "  DATASET: TUEV | TUAB | TUSZ | DIAGNOSIS | all (default: all)"
     echo ""
     echo "Examples:"
-    echo "  $0                       # all models x all datasets (${#ALL_MODELS[@]}x${#ALL_DATASETS[@]}=${$(( ${#ALL_MODELS[@]} * ${#ALL_DATASETS[@]} ))} runs)"
+    echo "  $0                       # all models x all datasets"
     echo "  $0 codebrain             # CodeBrain on all datasets"
-    echo "  $0 cbramod TUEV          # CBraMod on TUEV only"
-    echo "  $0 luna TUAB             # LUNA on TUAB only"
+    echo "  $0 cbramod DIAGNOSIS     # CBraMod on DIAGNOSIS only"
     echo "  $0 all TUEV              # All models on TUEV"
 }
 

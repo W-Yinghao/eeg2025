@@ -10,8 +10,8 @@ EEG数据分割和LMDB存储脚本
 输入: /projects/EEG-foundation-model/diagnosis_data_preprocessed/
 输出: /projects/EEG-foundation-model/diagnosis_data_lmdb/
 
-作者: Auto-generated
-日期: 2024
+作者: Yinghao WANG
+日期: 2025.2
 """
 
 import os
@@ -69,9 +69,9 @@ DATASET_CONFIG = {
 }
 
 # 分割参数
-SEGMENT_DURATION = 1.0  # 秒
-SAMPLING_RATE = 250     # Hz
-SEGMENT_SAMPLES = int(SEGMENT_DURATION * SAMPLING_RATE)  # 250 samples
+SEGMENT_DURATION = 5.0  # 秒 (seq_len=5, 匹配TUEV/TUAB/AD_DIAGNOSIS)
+SAMPLING_RATE = 200     # Hz (匹配CBraMod/CodeBrain/LUNA的patch_size=200)
+SEGMENT_SAMPLES = int(SEGMENT_DURATION * SAMPLING_RATE)  # 1000 samples
 
 
 class EEGSegmenter:
@@ -91,7 +91,7 @@ class EEGSegmenter:
         self.segment_duration = segment_duration
         self.overlap = overlap
 
-    def segment_file(self, file_path, device, disease):
+    def segment_file(self, file_path, device, disease, subject_id=None):
         """
         分割单个文件
 
@@ -103,6 +103,8 @@ class EEGSegmenter:
             采集设备类型
         disease : str
             疾病类型
+        subject_id : str, optional
+            被试ID，用于cross-subject split
 
         Returns
         -------
@@ -110,6 +112,9 @@ class EEGSegmenter:
             分割后的数据列表，每个元素为 (segment_data, labels_dict)
         """
         file_path = Path(file_path)
+        if subject_id is None:
+            # 从文件名提取subject_id: xxx_preprocessed.fif -> xxx
+            subject_id = file_path.stem.replace('_preprocessed', '')
 
         try:
             # 读取数据
@@ -134,6 +139,7 @@ class EEGSegmenter:
                 labels = {
                     'device': device,
                     'disease': disease,
+                    'subject_id': subject_id,
                     'source_file': file_path.name,
                     'segment_idx': segment_idx,
                     'start_sample': start,
@@ -227,8 +233,10 @@ def write_to_lmdb(segments, output_path, map_size=100*1024*1024*1024):
     # 写入数据
     with env.begin(write=True) as txn:
         # 写入元数据
+        subject_ids = list(set(labels['subject_id'] for _, labels in segments))
         metadata = {
             'n_segments': len(segments),
+            'n_subjects': len(subject_ids),
             'segment_duration': SEGMENT_DURATION,
             'sampling_rate': SAMPLING_RATE,
             'segment_samples': SEGMENT_SAMPLES,
@@ -273,6 +281,10 @@ def write_to_lmdb(segments, output_path, map_size=100*1024*1024*1024):
         for (device, disease), count in stats['device_disease'].items():
             f.write(f"  {device} x {disease}: {count}\n")
 
+        f.write(f"\nSubjects per Disease:\n")
+        for disease, subjects in stats['subjects_per_disease'].items():
+            f.write(f"  {disease}: {len(subjects)} subjects\n")
+
     logger.info(f"统计信息保存到: {stats_path}")
 
 
@@ -284,15 +296,18 @@ def compute_statistics(segments):
         'device': defaultdict(int),
         'disease': defaultdict(int),
         'device_disease': defaultdict(int),
+        'subjects_per_disease': defaultdict(set),
     }
 
     for _, labels in segments:
         device = labels['device']
         disease = labels['disease']
+        subject_id = labels['subject_id']
 
         stats['device'][device] += 1
         stats['disease'][disease] += 1
         stats['device_disease'][(device, disease)] += 1
+        stats['subjects_per_disease'][disease].add(subject_id)
 
     return stats
 
@@ -369,8 +384,8 @@ class LMDBDataset:
 def main():
     """主函数"""
     # 配置路径
-    input_base = Path('/projects/EEG-foundation-model/diagnosis_data_preprocessed')
-    output_base = Path('/projects/EEG-foundation-model/diagnosis_data_lmdb')
+    input_base = Path('/projects/EEG-foundation-model/diagnosis_data_preprocessed——5s')
+    output_base = Path('/projects/EEG-foundation-model/diagnosis_data_lmdb——5s')
 
     logger.info("=" * 60)
     logger.info("EEG数据分割和LMDB存储")

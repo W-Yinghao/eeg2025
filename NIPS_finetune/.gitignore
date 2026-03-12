@@ -1,0 +1,21 @@
+# Slurm output files
+slurm-*.out
+scripts/slurm-*.out
+slurm_log/*.out
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Checkpoints and logs (large files)
+checkpoints_*/
+logs_*/
+*.pth
+*.safetensors
+wandb/
+
+# Data
+*.lmdb
+*.mdb

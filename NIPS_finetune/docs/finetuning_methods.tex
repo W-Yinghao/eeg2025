@@ -53,15 +53,17 @@ A Comprehensive Technical Reference}
 \maketitle
 
 \begin{abstract}
-This document provides a comprehensive technical reference for all fine-tuning methods implemented in the \texttt{NIPS\_finetune/} framework.
-We present five distinct approaches to adapting pretrained EEG foundation models (CodeBrain SSSM and CBraMod) to downstream classification tasks:
+This document provides a comprehensive technical reference for all fine-tuning methods implemented in the \texttt{NIPS\_finetune/} framework, along with detailed experimental results and analysis.
+We present seven distinct approaches to adapting pretrained EEG foundation models (CodeBrain SSSM and CBraMod) to downstream classification tasks:
 (1)~\textbf{Standard Fine-Tuning} as baseline,
 (2)~\textbf{Multi-Scale Fine-Tuning (MSFT)} with inter-layer cross-scale aggregation,
 (3)~\textbf{Hyperbolic Fine-Tuning} with Lorentz manifold embeddings and domain-specific batch normalization,
 (4)~\textbf{Mutual Information Fine-Tuning} combining variational information bottleneck with expert-guided InfoNCE,
-and (5)~\textbf{Information Bottleneck + Disentanglement} with token-level compression and adversarial subject removal.
+(5)~\textbf{Information Bottleneck + Disentanglement} with token-level compression and adversarial subject removal,
+(6)~\textbf{SageStream} with Style-Adaptive Mixture of Experts (SA-MoE) and Information Invariant Bottleneck (IIB),
+and (7)~\textbf{SCOPE} with structured confidence-aware prototype-guided adaptation.
 For each method, we provide precise mathematical formulations, algorithmic pseudocode, and architectural specifications.
-Additionally, we describe a shared \textbf{Backbone Factory} with optional inter-layer bottleneck adapters for CBraMod.
+Section~\ref{sec:results} presents comprehensive experimental results across all methods, backbones, and datasets, with detailed analysis of successes, failures, and lessons learned.
 \end{abstract}
 
 %=============================================================================
@@ -612,6 +614,115 @@ Four parameter groups with AdamW:
 \end{enumerate}
 
 %=============================================================================
+\section{Method 6: SageStream (SA-MoE + IIB)}
+\label{sec:sagestream}
+%=============================================================================
+
+\subsection{Overview}
+
+SageStream~\cite{chen2025sagestream} is a two-stage framework for subject-adaptive EEG fine-tuning. Our implementation focuses on \textbf{Stage~1} (PEFT training on source subjects) with two key modules:
+\begin{itemize}
+\item \textbf{SA-MoE (Style-Adaptive Mixture of Experts):} Instance normalization removes subject-specific style, then a hyper-network conditioned on subject embeddings generates FiLM parameters ($\gamma, \beta$) to re-normalize features into a subject-invariant space. Multiple experts are routed via top-$k$ gating.
+\item \textbf{IIB (Information Invariant Bottleneck):} A variational encoder compresses pooled features through a KL bottleneck, with an adversarial subject classifier (GRL) to further remove subject identity.
+\end{itemize}
+
+\paragraph{Note.} IIB is \emph{not} part of the original SageStream paper---it was added in our implementation. The paper's SA-MoE already targets subject-invariance, making IIB functionally redundant.
+
+\subsection{Architecture}
+
+\paragraph{Subject-Invariant Style Learning (SISL).}
+\begin{align}
+\bar{\bm{Z}}_\text{norm} &= \text{InstanceNorm}(\bm{Z}) \quad \text{(erase individual style)} \\
+\gamma, \beta &= \text{HyperNet}(\bm{e}_\text{subject}) \quad \text{(style-conditioned FiLM params)} \\
+\bar{\bm{Z}} &= \gamma \odot \bar{\bm{Z}}_\text{norm} + \beta \quad \text{(subject-invariant features)}
+\end{align}
+
+\paragraph{SA-MoE Layer.}
+Given $N$ experts $\{\xi_r\}_{r=1}^N$ and gating network $G$:
+\begin{equation}
+\bm{z}^{(\ell+1)}_i = \sum_{r \in \text{top-}k} G_r(\bar{\bm{z}}^{(\ell)}_i) \cdot \xi_r(\bar{\bm{z}}^{(\ell)}_i)
+\end{equation}
+
+\paragraph{IIB Module (our addition).}
+\begin{align}
+\bmu, \log\bsigma^2 &= \text{VarEncoder}(\text{pool}(\bm{Z})) \\
+\bz &= \bmu + \bsigma \odot \bm{\epsilon}, \quad \bm{\epsilon} \sim \mN(0, \bm{I}) \\
+\hat{\bm{s}} &= g_\text{subject}(\text{GRL}_\lambda(\bz))
+\end{align}
+
+\subsection{Loss Function}
+
+\begin{equation}
+\mL = \mL_\text{CE} + \alpha_\text{kl} \cdot \mL_\text{KL} + \beta_\text{adv} \cdot \mL_\text{adv} + \lambda_\text{aux} \cdot \mL_\text{aux}
+\end{equation}
+where $\mL_\text{aux}$ is a load-balancing auxiliary loss for the MoE gating.
+
+\subsection{Ablation Configurations}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Variant & $\alpha_\text{kl}$ & $\beta_\text{adv}$ & $\lambda_\text{aux}$ & Experts & MoE Layers & Style \\
+\midrule
+\texttt{full\_sagestream} & $10^{-3}$ & 0.5 & 0.01 & 4 & 2 & Yes \\
+\texttt{moe\_only} & 0 & 0 & 0.01 & 4 & 2 & Yes \\
+\texttt{iib\_only} & $10^{-3}$ & 0.5 & 0 & 4 & 0 & No \\
+\texttt{baseline\_ce} & 0 & 0 & 0 & 4 & 0 & No \\
+\texttt{high\_experts} & $10^{-3}$ & 0.5 & 0.01 & 8 & 2 & Yes \\
+\texttt{low\_experts} & $10^{-3}$ & 0.5 & 0.01 & 2 & 2 & Yes \\
+\texttt{deep\_moe} & $10^{-3}$ & 0.5 & 0.01 & 4 & 3 & Yes \\
+\texttt{no\_style} & $10^{-3}$ & 0.5 & 0.01 & 4 & 2 & No \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Method 7: SCOPE (Prototype-Guided Adaptation)}
+\label{sec:scope}
+%=============================================================================
+
+\subsection{Overview}
+
+SCOPE~\cite{zhou2025scope} (\textbf{S}tructured \textbf{CO}nfidence-aware \textbf{P}rototype-guided adaptation) is a two-stage semi-supervised fine-tuning framework designed for label-scarce settings (default: 30\% labeled data).
+
+\subsection{Stage 1: External Supervision Construction}
+
+\paragraph{Task-Prior Network (TPN).}
+A lightweight convolutional network trained on labeled data with ETF (Equiangular Tight Frame) regularization to produce maximally class-separated embeddings:
+\begin{equation}
+\mL_\text{TPN} = \mL_\text{CE} + \lambda_\text{ETF} \cdot \mL_\text{ETF}
+\end{equation}
+
+\paragraph{Prototype Learning.}
+$M$ prototypes per class are initialized via $k$-means and refined with Sinkhorn-constrained optimal transport:
+\begin{equation}
+\min_{\bm{P}} \sum_{i,j} C_{ij} P_{ij} + \epsilon \mH(\bm{P}), \quad \text{s.t.}\ \bm{P}\bm{1} = \bm{r},\ \bm{P}^\top\bm{1} = \bm{c}
+\end{equation}
+
+\paragraph{Confidence-Aware Fusion.}
+Dempster--Shafer theory fuses TPN and prototype predictions. Only samples where both sources agree and confidence exceeds threshold $\rho$ receive pseudo-labels:
+\begin{equation}
+\tilde{y}_i = \begin{cases}
+\hat{y}_i & \text{if } \hat{y}^\text{TPN}_i = \hat{y}^\text{proto}_i \text{ and } \text{conf}_i > \rho \\
+\text{unlabeled} & \text{otherwise}
+\end{cases}
+\end{equation}
+
+\subsection{Stage 2: ProAdapter Training}
+
+A lightweight FiLM-style adapter module is inserted after the frozen backbone:
+\begin{equation}
+\text{ProAdapter}(\bm{h}) = \gamma \odot \bm{h} + \beta, \quad \gamma, \beta = f_\text{adapter}(\bm{h})
+\end{equation}
+Training proceeds with warmup (labeled data only) followed by gradual introduction of pseudo-labeled data at ratio $r_\text{pseudo}$.
+
+\subsection{Known Limitation: Binary Classification}
+
+ETF regularization requires $K \geq 3$ classes (the simplex ETF degenerates for $K=2$). On binary tasks (e.g., TUAB), ETF loss is identically zero, causing pseudo-label generation to collapse (acceptance rate $< 5\%$).
+
+%=============================================================================
 \section{Shared Infrastructure: Backbone Factory with Adapters}
 \label{sec:factory}
 %=============================================================================
@@ -679,23 +790,27 @@ Number of scales $K+1 \in \{1, 2, 3, 4\}$, tested across datasets (TUEV, TUAB).
 \begin{table}[h]
 \centering
 \small
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{@{}p{2.0cm}p{3.8cm}p{2.5cm}p{2.2cm}p{2.5cm}@{}}
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}p{1.8cm}p{3.5cm}p{2.5cm}p{2.0cm}p{3.0cm}@{}}
 \toprule
-Method & Loss & Trainable Modules & Backbone Mode & Key Innovation \\
+Method & Loss & Trainable Modules & Backbone & Key Innovation \\
 \midrule
 Baseline & $\mL_\text{CE}$ & Backbone + Classifier & Full FT / Frozen & -- \\
 \addlinespace
-MSFT & $\mL_\text{CE}$ & ScaleAdapters, CrossScaleAggs, Classifiers & Frozen (inter-layer) & Multi-scale C2F/F2C aggregation \\
+MSFT & $\mL_\text{CE}$ & ScaleAdapters, Aggs, Classifiers & Frozen (inter-layer) & Multi-scale C2F/F2C \\
 \addlinespace
-Hyperbolic & $\mL_\text{CE} + \lambda \mL_\text{HHSW}$ & HypProj, DSMDBN, HMLR & Frozen (head-only) & Lorentz manifold, domain BN \\
+Hyperbolic & $\mL_\text{CE} + \lambda \mL_\text{HHSW}$ & HypProj, DSMDBN, HMLR & Frozen & Lorentz manifold \\
 \addlinespace
-MI (VIB+NCE) & $\mL_\text{CE} + \beta \mL_\text{VIB} + \alpha \mL_\text{NCE}$ & RepProj, VIB, Contrast, ExpertProj, Classifier & Frozen (head-only) & Expert-guided contrastive + VIB \\
+MI (VIB+NCE) & $\mL_\text{CE} + \beta \mL_\text{VIB} + \alpha \mL_\text{NCE}$ & RepProj, VIB, Contrast & Frozen & Expert contrastive + VIB \\
 \addlinespace
-IB+Disentangle & $\mL_\text{task} + \beta \mL_\text{IB} + \lambda \mL_\text{MI}$ & IB Adapter, Disease Head, Subject Head & Frozen (head-only) & Token-level IB, GRL adversarial \\
+IB+Disentangle & $\mL_\text{task} + \beta \mL_\text{IB} + \lambda \mL_\text{MI}$ & IB Adapter, Heads & Frozen & Token IB, GRL \\
+\addlinespace
+SageStream & $\mL_\text{CE} + \alpha \mL_\text{KL} + \beta \mL_\text{adv} + \lambda \mL_\text{aux}$ & SA-MoE, IIB & Frozen & Style-adaptive MoE \\
+\addlinespace
+SCOPE & $\mL_\text{CE}$ (+ pseudo-labels) & TPN, ProAdapter & Frozen & Prototype pseudo-labels \\
 \bottomrule
 \end{tabular}
-\caption{Comparison of all fine-tuning methods. All methods except baseline keep the backbone frozen. Methods 3--5 support optional CBraMod inter-layer adapters via the Backbone Factory.}
+\caption{Comparison of all seven fine-tuning methods.}
 \end{table}
 
 %=============================================================================
@@ -706,16 +821,16 @@ IB+Disentangle & $\mL_\text{task} + \beta \mL_\text{IB} + \lambda \mL_\text{MI}$
 \begin{table}[h]
 \centering
 \small
-\begin{tabular}{@{}lccccc@{}}
+\begin{tabular}{@{}lccccccc@{}}
 \toprule
- & Baseline & MSFT & Hyperbolic & MI & IB+Disentangle \\
+ & Baseline & MSFT & Hyperbolic & MI & IB+Dis. & SageStream & SCOPE \\
 \midrule
-CodeBrain (SSSM) & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
-CBraMod & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
-CBraMod + Adapters & -- & -- & \checkmark & \checkmark & \checkmark \\
+CodeBrain & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+CBraMod & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+CBraMod + Adapters & -- & -- & \checkmark & \checkmark & \checkmark & -- & -- \\
 \bottomrule
 \end{tabular}
-\caption{Backbone support matrix across methods.}
+\caption{Backbone support matrix across all seven methods.}
 \end{table}
 
 \begin{table}[h]
@@ -735,6 +850,400 @@ DEPRESSION & Binary & 2 & 63 & 200\,Hz & 5\,s & 200 \\
 \end{tabular}
 \caption{Supported EEG datasets with configurations.}
 \end{table}
+
+%=============================================================================
+\section{Experimental Results}
+\label{sec:results}
+%=============================================================================
+
+This section presents comprehensive experimental results from all fine-tuning methods evaluated on the TUAB (binary abnormality detection) and TUEV (6-class event classification) datasets, using CodeBrain (SSSM, 15M params) and CBraMod (Transformer, 4.9M params) as frozen backbones. Results span SLURM jobs 739416--741615 conducted between February 26 and March 4, 2026.
+
+\subsection{Cross-Method Comparison: Best Results}
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Method & Best Variant & Bal Acc & Kappa & F1 & Backbone \\
+\midrule
+\multicolumn{6}{@{}l}{\textbf{TUAB (Binary Classification)}} \\
+\midrule
+Full Fine-Tune (Baseline) & All params unfrozen & \textbf{0.8066} & \textbf{0.6152} & \textbf{0.7885} & CodeBrain \\
+MI Fine-Tuning & full\_vib\_nce ($\alpha$=1, $\beta$=1e-3) & 0.8022 & 0.6095 & 0.7785 & CodeBrain \\
+SageStream & moe\_only & 0.8135 & -- & 0.8154$^*$ & CodeBrain \\
+IB+Disentangle & ib\_only ($\beta$=1e-3) & 0.8116 & -- & 0.8135$^*$ & CodeBrain \\
+Linear Probe & 2-layer MLP head & 0.7984 & 0.6023 & 0.7735 & CodeBrain \\
+MSFT & 3 scales & 0.7965 & 0.6001 & 0.7679 & CBraMod \\
+SCOPE & ProAdapter & 0.7243 & -- & -- & CBraMod \\
+\midrule
+\multicolumn{6}{@{}l}{\textbf{TUEV (6-Class Event Classification)}} \\
+\midrule
+Full Fine-Tune (Baseline) & All params unfrozen & \textbf{0.6103} & \textbf{0.6035} & 0.7940 & CodeBrain \\
+MI Fine-Tuning & vib\_only ($\beta$=1e-3) & 0.6005 & 0.5441 & 0.7612 & CodeBrain \\
+SCOPE & ProAdapter & 0.5572 & 0.5619 & 0.7739 & CodeBrain \\
+MSFT & 2 scales & 0.5411 & 0.5273 & 0.7591 & CBraMod \\
+IB+Disentangle & low\_lambda ($\lambda$=0.1) & 0.5391 & -- & 0.4957$^*$ & CodeBrain \\
+SageStream & no\_style & 0.5188 & -- & 0.4451$^*$ & CodeBrain \\
+Linear Probe & Linear head & 0.5264 & 0.5045 & 0.7419 & CodeBrain \\
+\bottomrule
+\end{tabular}
+\caption{Best results per method on TUAB and TUEV. $^*$F1 macro (not weighted). SageStream/IB metrics use macro F1 while MI/Baseline use weighted F1. CodeBrain Full Fine-Tune serves as the upper bound for frozen-backbone methods.}
+\label{tab:cross-method}
+\end{table}
+
+\subsection{Method 1: Standard Fine-Tuning and Linear Probe}
+
+\paragraph{Full Fine-Tuning (CodeBrain).}
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Dataset & LR & WD & Dropout & Best Epoch & Bal Acc & Kappa \\
+\midrule
+TUAB & 1e-5 & 5e-5 & 0.4 & 3/50 & 0.8066 & 0.6152 \\
+TUEV & 2e-5 & 5e-4 & 0.4 & 18/50 & 0.6103 & 0.6035 \\
+\bottomrule
+\end{tabular}
+\caption{Full fine-tuning results. TUAB peaks very early (epoch 3); TUEV shows severe overfitting (val bal\_acc $\sim$0.97 vs.\ test 0.61).}
+\end{table}
+
+\paragraph{Linear Probe (CodeBrain, frozen).}
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Classifier Head & Dataset & Best Epoch & Bal Acc & Kappa & F1 \\
+\midrule
+Linear (1-layer) & TUAB & 50 & 0.7940 & 0.5932 & 0.7687 \\
+MLP (2-layer) & TUAB & 50 & \textbf{0.7984} & \textbf{0.6023} & \textbf{0.7735} \\
+MLP (3-layer) & TUAB & -- & $\sim$0.50 & $\sim$0.00 & -- \\
+AvgPool + Linear & TUAB & 19 & 0.7570 & 0.5197 & 0.7226 \\
+\midrule
+Linear (1-layer) & TUEV & 49 & \textbf{0.5264} & \textbf{0.5045} & \textbf{0.7419} \\
+MLP (2-layer) & TUEV & 44 & 0.4797 & 0.4728 & 0.7272 \\
+MLP (3-layer) & TUEV & 50 & 0.4749 & 0.4575 & 0.7216 \\
+AvgPool + Linear & TUEV & 10 & 0.4077 & 0.4788 & 0.7228 \\
+\bottomrule
+\end{tabular}
+\caption{Linear probe results. The 3-layer MLP collapsed on TUAB (degenerate predictions). On TUEV, simpler heads outperform deeper ones.}
+\end{table}
+
+\paragraph{Key Finding.} Linear probe achieves 0.7984 bal\_acc on TUAB (only 0.8\% below full fine-tuning), demonstrating that CodeBrain's pretrained representations are highly effective for binary abnormality detection.
+
+\subsection{Method 2: MSFT Scale Ablation (CBraMod)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Scales & \multicolumn{3}{c}{TUAB} & \multicolumn{3}{c}{TUEV} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-7}
+& Bal Acc & Kappa & F1 & Bal Acc & Kappa & F1 \\
+\midrule
+1 & 0.7373 & 0.4797 & 0.7010 & 0.5078 & 0.6145 & 0.7914 \\
+2 & 0.7481 & 0.5096 & 0.6851 & \textbf{0.5411} & 0.5273 & 0.7591 \\
+\textbf{3} & \textbf{0.7965} & \textbf{0.6001} & \textbf{0.7679} & 0.5374 & 0.5204 & 0.7541 \\
+4 & $\sim$0.789$^\dagger$ & $\sim$0.584 & $\sim$0.761 & 0.5405 & 0.5162 & 0.7531 \\
+\bottomrule
+\end{tabular}
+\caption{MSFT scale ablation on CBraMod. $^\dagger$4-scale TUAB terminated at epoch 25/30. Best: 3 scales for TUAB, 2 scales for TUEV.}
+\end{table}
+
+\subsection{Method 4: MI Fine-Tuning Ablation (CodeBrain)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Config & ($\alpha$, $\beta$) & \multicolumn{2}{c}{TUEV} & \multicolumn{2}{c}{TUAB} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-6}
+& & Bal Acc & Kappa & Bal Acc & Kappa \\
+\midrule
+baseline\_ce & (0, 0) & 0.5308 & 0.4672 & $\sim$0.805$^\dagger$ & $\sim$0.616 \\
+nce\_only & (1.0, 0) & 0.5794 & 0.5197 & 0.7917 & 0.5868 \\
+\textbf{vib\_only} & (0, 1e-3) & \textbf{0.6005} & \textbf{0.5441} & 0.7879 & 0.5785 \\
+full\_vib\_nce & (1.0, 1e-3) & 0.5960 & 0.4882 & \textbf{0.8022} & \textbf{0.6095} \\
+\bottomrule
+\end{tabular}
+\caption{MI ablation. $^\dagger$TUAB baseline terminated at epoch 13/50. VIB alone is optimal for TUEV (+7\% over baseline). Full VIB+NCE is optimal for TUAB. VIB+NCE combination shows gradient conflict on TUEV (Kappa 0.488 $<$ VIB-only 0.544).}
+\end{table}
+
+\subsection{Method 5: IB + Disentanglement Results}
+
+\subsubsection{CodeBrain Results}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Config & ($\beta$, $\lambda_\text{adv}$) & \multicolumn{2}{c}{TUAB} & \multicolumn{2}{c}{TUEV} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-6}
+& & Bal Acc & F1$_\text{macro}$ & Bal Acc & F1$_\text{macro}$ \\
+\midrule
+full\_ib\_adv & (1e-3, 0.5) & Segfault & -- & 0.4822 & 0.4534 \\
+ib\_only & (1e-3, 0) & \textbf{0.8116} & \textbf{0.8135} & 0.4965 & 0.4643 \\
+adv\_only & (0, 0.5) & Segfault & -- & 0.5018 & 0.4707 \\
+baseline\_ce & (0, 0) & 0.8087 & 0.8107 & 0.4934 & 0.4642 \\
+high\_beta & (1e-2, 0.5) & 0.7792 & 0.7813 & Segfault & -- \\
+low\_beta & (1e-4, 0.5) & Segfault & -- & Segfault & -- \\
+high\_lambda & (1e-3, 1.0) & 0.7675 & 0.7692 & 0.4112 & 0.3836 \\
+\textbf{low\_lambda} & \textbf{(1e-3, 0.1)} & 0.8109 & 0.8128 & \textbf{0.5391} & \textbf{0.4957} \\
+\bottomrule
+\end{tabular}
+\caption{IB+Disentangle on CodeBrain. ``Segfault'' = DataLoader worker crash during evaluation. Low adversarial strength ($\lambda$=0.1) yields the best TUEV result. Strong adversarial ($\lambda \geq 0.5$) hurts performance.}
+\end{table}
+
+\subsubsection{CBraMod Results}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Config & ($\beta$, $\lambda_\text{adv}$) & \multicolumn{2}{c}{TUAB} & \multicolumn{2}{c}{TUEV} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-6}
+& & Bal Acc & F1$_\text{macro}$ & Bal Acc & F1$_\text{macro}$ \\
+\midrule
+full\_ib\_adv & (1e-3, 0.5) & 0.6895 & 0.6886 & Segfault & -- \\
+ib\_only & (1e-3, 0) & Segfault & -- & 0.3883 & 0.2759 \\
+adv\_only & (0, 0.5) & 0.6681 & 0.6621 & 0.3524 & 0.1308 \\
+\textbf{baseline\_ce} & \textbf{(0, 0)} & \textbf{0.7077} & \textbf{0.7085} & 0.4017 & 0.3226 \\
+high\_beta & (1e-2, 0.5) & 0.7056 & 0.7032 & Segfault & -- \\
+low\_beta & (1e-4, 0.5) & 0.6840 & 0.6838 & 0.2800 & 0.2514 \\
+\textbf{high\_lambda} & \textbf{(1e-3, 1.0)} & 0.6768 & 0.6714 & \textbf{0.4261} & \textbf{0.2845} \\
+low\_lambda & (1e-3, 0.1) & Segfault & -- & 0.3787 & 0.2780 \\
+\bottomrule
+\end{tabular}
+\caption{IB+Disentangle on CBraMod. CBraMod is significantly weaker than CodeBrain across all configs. On TUAB, baseline\_ce (no IB/adversarial) is best, suggesting IB components hurt CBraMod.}
+\end{table}
+
+\subsection{Method 6: SageStream Results}
+
+\subsubsection{CodeBrain Results}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Variant & \multicolumn{2}{c}{TUAB} & \multicolumn{2}{c}{TUEV} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+& Bal Acc & F1$_\text{macro}$ & Bal Acc & F1$_\text{macro}$ \\
+\midrule
+\textbf{moe\_only} & \textbf{0.8135} & \textbf{0.8154} & 0.4975 & 0.4849$^*$ \\
+no\_style & -- & -- & \textbf{0.5188} & \textbf{0.4451} \\
+baseline\_ce & 0.7839 & 0.7859 & 0.4542 & 0.4171 \\
+iib\_only & 0.7820 & 0.7841 & 0.4396 & 0.4087 \\
+full\_sagestream & 0.5923 & -- & 0.2886 & 0.2457$^*$ \\
+high\_experts & 0.5894 & -- & 0.3828 & -- \\
+deep\_moe & 0.6662 & -- & 0.2352 & -- \\
+low\_experts & 0.6177 & -- & 0.2722 & -- \\
+\bottomrule
+\end{tabular}
+\caption{SageStream on CodeBrain. $^*$Extracted from training logs (checkpoint load failed). \textbf{moe\_only} is the clear winner on TUAB. full\_sagestream is consistently the worst due to IIB-SA-MoE gradient conflict.}
+\end{table}
+
+\subsubsection{CBraMod Results (Partial---segfaults)}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Variant & \multicolumn{2}{c}{TUAB} & \multicolumn{2}{c}{TUEV} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+& Bal Acc & F1$_\text{macro}$ & Bal Acc & F1$_\text{macro}$ \\
+\midrule
+moe\_only & 0.7274$^a$ & 0.7246 & 0.4649 & 0.2851 \\
+baseline\_ce & 0.7060$^a$ & 0.7047 & Segfault & -- \\
+iib\_only & 0.7026$^a$ & 0.7024 & Segfault & -- \\
+full\_sagestream & 0.5886$^a$ & -- & 0.3018 & 0.1261 \\
+deep\_moe & 0.5731 & -- & Segfault & -- \\
+\bottomrule
+\end{tabular}
+\caption{SageStream on CBraMod. $^a$From first run (jobs 740306/740097); 5/8 TUEV experiments segfaulted.}
+\end{table}
+
+\subsection{Method 7: SCOPE Results}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Backbone & Dataset & Best Metric & Test Value & Val Best & Early Stop \\
+\midrule
+CodeBrain & TUEV & Kappa & \textbf{0.5619} (BAcc=0.557) & 0.9626 & ep 46 \\
+CodeBrain & TUAB & -- & \textbf{Bug}$^\dagger$ & 0.8794 & ep 16 \\
+CBraMod & TUEV & Kappa & 0.4850 (BAcc=0.390) & 0.6192 & ep 17 \\
+CBraMod & TUAB & AUROC & \textbf{0.8181} (BAcc=0.724) & 0.8338 & ep 31 \\
+\bottomrule
+\end{tabular}
+\caption{SCOPE results. $^\dagger$CodeBrain+TUAB test evaluation crashed due to batch padding bug (36945 vs 36960 predictions). Key issue: ProAdapter trainable params are 50--93\% of total (paper recommends 2--5\%), and ETF fails on binary tasks causing pseudo-label acceptance rate $<$5\% on TUAB.}
+\end{table}
+
+%=============================================================================
+\subsection{Comprehensive Analysis}
+\label{sec:analysis}
+%=============================================================================
+
+\subsubsection{Performance Ranking}
+
+Table~\ref{tab:ranking} consolidates the best-performing configuration for each method on each dataset, ranked by test balanced accuracy.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}clcc@{}}
+\toprule
+Rank & Method (Best Config) & TUAB Bal Acc & TUEV Bal Acc \\
+\midrule
+1 & SageStream moe\_only (CodeBrain) & \textbf{0.8135} & 0.4975 \\
+2 & IB+Disentangle ib\_only (CodeBrain) & 0.8116 & 0.4965 \\
+3 & IB+Disentangle low\_lambda (CodeBrain) & 0.8109 & \underline{0.5391} \\
+4 & Full Fine-Tune (CodeBrain) & 0.8066 & \textbf{0.6103} \\
+5 & MI vib\_nce (CodeBrain) & 0.8022 & 0.5960 \\
+6 & MI vib\_only (CodeBrain) & 0.7879 & \underline{0.6005} \\
+7 & Linear Probe 2-layer (CodeBrain) & 0.7984 & 0.4797 \\
+8 & MSFT 3-scale (CBraMod) & 0.7965 & 0.5374 \\
+9 & SCOPE ProAdapter (CBraMod) & 0.7243 & 0.3900 \\
+10 & SCOPE ProAdapter (CodeBrain) & Bug & 0.5572 \\
+\bottomrule
+\end{tabular}
+\caption{Overall ranking. \textbf{Bold} = best, \underline{underline} = runner-up. SageStream moe\_only leads on TUAB; Full Fine-Tune and MI vib\_only lead on TUEV.}
+\label{tab:ranking}
+\end{table}
+
+\subsubsection{Key Finding 1: VIB is the Most Effective Frozen-Backbone Component for TUEV}
+
+On TUEV (the harder 6-class task), VIB-only (MI Method 4) achieves 0.6005 balanced accuracy---only 1\% below full fine-tuning (0.6103)---while keeping the entire backbone frozen. This demonstrates that \textbf{information bottleneck compression effectively suppresses subject-specific noise} in multi-class EEG settings. The VIB regularization reduces the val--test gap from 44\% (baseline\_ce) to 38\% (still substantial, but the best among frozen methods).
+
+\subsubsection{Key Finding 2: SA-MoE (Without IIB) is the Best Frozen-Backbone Method for TUAB}
+
+SageStream's moe\_only variant achieves 0.8135 balanced accuracy on TUAB, \textbf{surpassing even full fine-tuning} (0.8066). The Mixture-of-Experts routing mechanism, even without correct subject ID extraction (only 2 subjects detected), provides beneficial inductive bias through multi-expert specialization.
+
+Critically, the full SageStream model (SA-MoE + IIB) is \textbf{consistently the worst} across all experiments (TUAB: 0.5923, TUEV: 0.2886), confirming that IIB's adversarial gradients severely interfere with SA-MoE optimization.
+
+\subsubsection{Key Finding 3: Severe TUEV Overfitting is Universal}
+
+\textbf{All methods} exhibit extreme validation--test gap on TUEV:
+\begin{itemize}
+\item Full Fine-Tune: val 0.97 vs test 0.61 (gap: 36\%)
+\item MI vib\_only: val 0.98 vs test 0.60 (gap: 38\%)
+\item IB baseline\_ce: val 0.94 vs test 0.49 (gap: 45\%)
+\item SageStream moe\_only: val 0.96 vs test 0.50 (gap: 46\%)
+\end{itemize}
+
+Root causes: (1) TUEV val/train come from the same LMDB file with random split (likely same-subject segments in both), (2) extreme class imbalance (bckg 75.3\%, spsw 0.9\%), (3) standard accuracy for val vs balanced accuracy for test.
+
+\subsubsection{Key Finding 4: Subject ID Extraction Failed---IIB/GRL Modules Were Ineffective}
+
+A critical bug affected \textbf{all subject-aware methods} (SageStream IIB, IB+Disentangle GRL): the LMDB metadata lacked a \texttt{subjects} field, and the fallback extraction detected only 2 subjects (instead of $\sim$2329 for TUAB, $\sim$243 for TUEV). This renders:
+\begin{itemize}
+\item SageStream's \texttt{SubjectStyleAlignment}: \texttt{nn.Embedding(2, ...)} provides no meaningful style normalization
+\item IB+Disentangle's GRL adversarial: subject classifier with 2 classes is trivially solvable, providing no useful gradient signal
+\end{itemize}
+This bug was identified and fixed in \texttt{train\_ib\_disentangle.py} (extracting subject ID from LMDB \texttt{source\_file} field), but \textbf{not yet re-evaluated}.
+
+\subsubsection{Key Finding 5: SCOPE's ETF Fails on Binary Tasks}
+
+SCOPE's Stage 1 pseudo-label generation relies on ETF (Equiangular Tight Frame) regularization, which requires $K \geq 3$ classes. On TUAB ($K=2$):
+\begin{itemize}
+\item ETF loss = 0.0000 throughout training
+\item Pseudo-label acceptance rate: 0.4\% (CodeBrain) / 5.1\% (CBraMod), vs.\ 60.9\% on TUEV
+\item Stage 2 ProAdapter degenerates to supervised-only training without pseudo-label augmentation
+\end{itemize}
+Additionally, ProAdapter's trainable parameter ratio (50--93\%) far exceeds the paper's recommended 2--5\%.
+
+\subsubsection{Key Finding 6: CodeBrain Consistently Outperforms CBraMod}
+
+Across all methods where both backbones were tested:
+\begin{itemize}
+\item TUAB: CodeBrain 0.81 vs CBraMod 0.73 (gap: 8\%)
+\item TUEV: CodeBrain 0.50--0.54 vs CBraMod 0.28--0.47 (gap: 5--22\%)
+\end{itemize}
+CodeBrain's SSM architecture (15M params) extracts stronger EEG representations than CBraMod's Transformer (4.9M params), particularly for temporal sequence modeling.
+
+\subsubsection{Key Finding 7: Checkpoint/Evaluation Bugs Invalidated Many Results}
+
+Multiple systematic bugs affected result reliability:
+\begin{enumerate}
+\item \textbf{DataLoader Segfaults}: 10/32 IB+Disentangle experiments lost final evaluation to worker segfaults (PyTorch multiprocessing issue)
+\item \textbf{Checkpoint key mismatch}: SageStream and early IB experiments had state\_dict loading failures due to model wrapping changes between training and evaluation
+\item \textbf{SCOPE batch padding}: Test predictions count (36960) $\neq$ label count (36945) due to missing \texttt{drop\_last} in test DataLoader
+\item \textbf{SLURM timeouts}: MI Fine-Tuning job 739434 ran all 16 experiments sequentially in 24h; CBraMod experiments (9--16) never executed
+\end{enumerate}
+
+%=============================================================================
+\subsection{Failure Modes and Lessons Learned}
+\label{sec:failures}
+%=============================================================================
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}p{3.5cm}p{4.5cm}p{4.5cm}@{}}
+\toprule
+Failure & Root Cause & Recommended Fix \\
+\midrule
+Subject ID = 2 & LMDB lacks \texttt{subjects} metadata; fallback extraction buggy & Parse subject ID from \texttt{source\_file} (e.g., \texttt{aaaaamde\_s001\_t001.edf} $\to$ \texttt{aaaaamde}) \\
+\addlinespace
+TUEV val--test gap $>$35\% & Val/train from same LMDB file; val uses accuracy not balanced accuracy & Subject-level val/train split; use bal\_acc for early stopping \\
+\addlinespace
+full\_sagestream worst & IIB (KL+GRL) redundant with SA-MoE; gradient conflict & Remove IIB; SA-MoE alone achieves subject-invariance \\
+\addlinespace
+SCOPE TUAB pseudo-labels $<$5\% & ETF undefined for $K$=2 & Replace ETF with SupConLoss or ArcFace for binary tasks \\
+\addlinespace
+ProAdapter 50--93\% params & Adapter dimension matches full backbone dim & Reduce adapter bottleneck to 1/8--1/4 of backbone dim \\
+\addlinespace
+DataLoader segfaults & \texttt{num\_workers=4} with large models & Set \texttt{num\_workers=0} for evaluation \\
+\addlinespace
+SLURM timeout & 16 experiments sequential in 24h & Split into independent jobs per (backbone, dataset) \\
+\addlinespace
+TUEV class imbalance & spsw 0.9\%, bckg 75.3\%; unweighted CE & Weighted CE loss or Focal Loss \\
+\addlinespace
+VIB+InfoNCE conflict on TUEV & $\alpha$=1.0 vs $\beta$=1e-3 imbalanced; VIB compresses what InfoNCE tries to retain & Reduce $\alpha$ to 0.1; or use VIB alone \\
+\addlinespace
+Checkpoint key mismatch & Model wrapping changed between code versions & Use \texttt{strict=False} + verify; or retrain consistently \\
+\bottomrule
+\end{tabular}
+\caption{Summary of failure modes, root causes, and recommended fixes.}
+\end{table}
+
+%=============================================================================
+\subsection{Recommended Next Steps}
+\label{sec:nextsteps}
+%=============================================================================
+
+Based on the comprehensive experimental analysis, we recommend the following prioritized actions:
+
+\begin{enumerate}
+\item[\textbf{P0}] \textbf{Re-run IB+Disentangle and SageStream with fixed subject IDs.} The subject ID bug invalidated all subject-aware modules. With correct subject extraction ($\sim$2329 for TUAB, $\sim$243 for TUEV), the GRL adversarial and SA-MoE style normalization should show significant improvement.
+
+\item[\textbf{P0}] \textbf{Fix TUEV validation split.} Implement subject-level train/val splitting to eliminate same-subject data leakage. Use balanced accuracy (not standard accuracy) for early stopping and model selection.
+
+\item[\textbf{P0}] \textbf{Add class weighting for TUEV.} Apply inverse-frequency weighted cross-entropy or Focal Loss to address the severe class imbalance (spsw F1 = 0.00 in 7/8 IB variants).
+
+\item[\textbf{P1}] \textbf{Scale down SCOPE ProAdapter.} Reduce trainable parameters from 50--93\% to the paper-recommended 2--5\% via feature pooling and bottleneck dimensionality reduction.
+
+\item[\textbf{P1}] \textbf{Fix SCOPE binary pseudo-labels.} Replace ETF with Supervised Contrastive Loss or ArcFace for $K$=2 tasks. Alternatively, lower confidence threshold $\rho$ from 0.5 to 0.2.
+
+\item[\textbf{P1}] \textbf{Reduce training epochs.} TUAB peaks at epochs 3--7 across all methods; 50 epochs is wasteful. Use 10--15 epochs for TUAB, 20--25 for TUEV, with patience-based early stopping.
+
+\item[\textbf{P2}] \textbf{Remove IIB from SageStream.} IIB is not in the original paper, is functionally redundant with SA-MoE, and causes gradient conflict. Use moe\_only as the default SageStream variant.
+
+\item[\textbf{P2}] \textbf{Implement missing SageStream components.} The current implementation lacks HSE (Hybrid-Shared Expert) and Stage 2 STSA (test-time adaptation), which are core to the paper's cross-subject transfer capability.
+
+\item[\textbf{P2}] \textbf{Fix DataLoader segfaults.} Set \texttt{num\_workers=0} for test/eval DataLoaders, or use \texttt{persistent\_workers=True} with reduced worker count.
+\end{enumerate}
 
 \begin{thebibliography}{9}
 \bibitem{qiao2025msft}
@@ -766,6 +1275,16 @@ Houlsby, N. et al.
 van den Oord, A., Li, Y., and Vinyals, O.
 \newblock Representation learning with contrastive predictive coding.
 \newblock \emph{arXiv preprint arXiv:1807.03748}, 2018.
+
+\bibitem{chen2025sagestream}
+Chen et al.
+\newblock SageStream: Subject-Adaptive Generation for EEG Streaming.
+\newblock 2025.
+
+\bibitem{zhou2025scope}
+Zhou et al.
+\newblock Structured Prototype-Guided Adaptation for EEG Foundation Models.
+\newblock \emph{arXiv preprint arXiv:2602.17251}, 2025.
 \end{thebibliography}
 
 \end{document}

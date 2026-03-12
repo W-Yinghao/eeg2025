@@ -21,8 +21,8 @@
 - EGI .mff (128通道 -> 58通道映射)
 - BrainVision .vhdr (64通道 -> 58通道映射)
 
-作者: Auto-generated based on EEGLAB preprocessing analysis
-日期: 2024
+作者: Yinghao WANG
+日期: 2025.2
 """
 
 import os
@@ -118,7 +118,7 @@ class EEGPreprocessor:
     """统一的EEG预处理器"""
 
     # 预处理参数（基于EEGLAB分析结果）
-    TARGET_SFREQ = 250  # 目标采样率
+    TARGET_SFREQ = 200  # 目标采样率 (匹配CBraMod/CodeBrain/LUNA的patch_size=200)
     FILTER_LOW = 0.5    # 高通滤波截止频率
     FILTER_HIGH = 45    # 低通滤波截止频率
 
@@ -540,7 +540,7 @@ def main():
     """主函数"""
     # 配置路径
     input_base = Path('/projects/EEG-foundation-model/diagnosis_data')
-    output_base = Path('/projects/EEG-foundation-model/diagnosis_data_preprocessed')
+    output_base = Path('/projects/EEG-foundation-model/diagnosis_data_preprocessed——5s')
 
     # 数据集列表
     datasets = [
