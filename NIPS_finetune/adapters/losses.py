@@ -28,6 +28,14 @@ def _rbf_kernel(x: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
     return torch.exp(-dists / (2 * sigma ** 2))
 
 
+def _delta_kernel(ids: torch.Tensor) -> torch.Tensor:
+    """
+    Delta (categorical) kernel matrix.  ids: (N,) integer IDs.
+    K(i, j) = 1 if ids[i] == ids[j] else 0.
+    """
+    return (ids.unsqueeze(0) == ids.unsqueeze(1)).float()
+
+
 def _hsic(K: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
     """
     Biased HSIC estimator.  K, L: (N, N) kernel matrices.
@@ -57,6 +65,9 @@ def class_conditional_hsic(
     This penalizes subject-specific information that leaks into z
     within the same disease class, encouraging class-relevant-only features.
 
+    Uses an RBF kernel on the z-side and a delta (categorical) kernel on the
+    subject-ID side, since subject IDs are unordered categorical identifiers.
+
     Args:
         z: (B, D) aggregated latent representation
         labels: (B,) class labels
@@ -71,14 +82,19 @@ def class_conditional_hsic(
 
     for y in unique_labels:
         mask = labels == y
-        if mask.sum() < 4:  # need enough samples for HSIC
+        # Bug 10 fix: require >=4 samples AND >=2 unique subjects within each class
+        if mask.sum() < 4:
+            continue
+
+        s_y = subject_ids[mask]
+        if s_y.unique().numel() < 2:
             continue
 
         z_y = z[mask]
-        s_y = subject_ids[mask].float().unsqueeze(1)  # (N_y, 1)
 
         K_z = _rbf_kernel(z_y, sigma=sigma_z)
-        K_s = _rbf_kernel(s_y, sigma=sigma_s)
+        # Bug 5 fix: use delta/categorical kernel for subject IDs
+        K_s = _delta_kernel(s_y)
 
         hsic_sum = hsic_sum + _hsic(K_z, K_s)
         count += 1
@@ -212,6 +228,8 @@ class USBALoss(nn.Module):
         enable_budget_reg: bool = True,
         task_type: str = 'multiclass',
         class_weights: Optional[torch.Tensor] = None,
+        kl_reduction: str = 'mean',
+        budget_warmup_epochs: int = 10,
     ):
         super().__init__()
         self.beta = beta
@@ -221,6 +239,8 @@ class USBALoss(nn.Module):
         self.enable_cc_inv = enable_cc_inv
         self.enable_budget_reg = enable_budget_reg
         self.task_type = task_type
+        self.kl_reduction = kl_reduction
+        self.budget_warmup_epochs = budget_warmup_epochs
 
         if class_weights is not None:
             self.register_buffer('class_weights', class_weights)
@@ -266,8 +286,12 @@ class USBALoss(nn.Module):
             # Global beta with warmup
             warmup_factor = min(current_epoch / max(beta_warmup_epochs, 1), 1.0)
             effective_beta = self.beta * warmup_factor
-            kl_total = adapter_aux.get('kl_total', torch.tensor(0.0, device=logits.device))
-            kl_weighted = effective_beta * kl_total
+            # Bug 8 fix: use kl_reduction to pick 'kl_mean' or 'kl_total'
+            if self.kl_reduction == 'mean':
+                kl_value = adapter_aux.get('kl_mean', adapter_aux.get('kl_total', torch.tensor(0.0, device=logits.device)))
+            else:
+                kl_value = adapter_aux.get('kl_total', torch.tensor(0.0, device=logits.device))
+            kl_weighted = effective_beta * kl_value
 
         # ── L_cc_inv ───────────────────────────────────────────────────
         loss_cc = torch.tensor(0.0, device=logits.device)
@@ -283,7 +307,15 @@ class USBALoss(nn.Module):
         loss_budget = torch.tensor(0.0, device=logits.device)
         if self.enable_budget_reg and self.eta_budget > 0:
             gate_vals = adapter_aux.get('_all_gate_vals', [])
-            loss_budget = compute_budget_loss(gate_vals, adapter)
+            raw_budget = compute_budget_loss(gate_vals, adapter)
+            # Bug 9 fix: budget warmup — zero before warmup, then linear ramp
+            if current_epoch < self.budget_warmup_epochs:
+                budget_factor = 0.0
+            else:
+                # Linear ramp over the warmup period after the start epoch
+                ramp_progress = (current_epoch - self.budget_warmup_epochs) / max(self.budget_warmup_epochs, 1)
+                budget_factor = min(ramp_progress, 1.0)
+            loss_budget = raw_budget * budget_factor
 
         # ── Total ──────────────────────────────────────────────────────
         total = (

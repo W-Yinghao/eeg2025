@@ -135,15 +135,26 @@ class ChannelAttention(nn.Module):
     Squeeze-and-excitation style attention.
 
     3D mode: SE along D axis (feature importance weighting).
-    4D-aware mode: reshape (B, C*S, D) → (B*S, C, D), apply SE along C axis
-    (true cross-channel attention per time step), reshape back.
+    4D-aware mode: reshape (B, C*S, D) → (B*S, C, D), pool over D to get
+    (B*S, C), apply channel-axis MLP to produce gate (B*S, C, 1), multiply
+    back (true cross-channel modulation per time step), reshape back.
 
     The 4D mode mirrors CBraMod's spatial attention path which also attends
     across channels independently per time step.
+
+    When n_channels is provided at init (or via build_spatial_branch), the
+    channel MLP is built eagerly. Otherwise it is lazily constructed on the
+    first forward call that supplies token_structure.
     """
 
-    def __init__(self, d_model: int, reduction: int = 4, dropout: float = 0.1):
+    def __init__(self, d_model: int, reduction: int = 4, dropout: float = 0.1,
+                 n_channels: Optional[int] = None):
         super().__init__()
+        self.d_model = d_model
+        self.reduction = reduction
+        self.dropout = dropout
+
+        # 3D fallback SE-on-D MLP (always available)
         mid = max(d_model // reduction, 8)
         self.fc = nn.Sequential(
             nn.Linear(d_model, mid),
@@ -153,22 +164,57 @@ class ChannelAttention(nn.Module):
             nn.Sigmoid(),
         )
 
+        # 4D channel-axis MLP: built eagerly if n_channels known, else lazily
+        self._n_channels: Optional[int] = None
+        if n_channels is not None:
+            self._build_channel_mlp(n_channels)
+
+    def _build_channel_mlp(self, n_channels: int) -> None:
+        """Build the channel-axis MLP for 4D mode and register it."""
+        self._n_channels = n_channels
+        mid_ch = max(n_channels // self.reduction, 4)
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(n_channels, mid_ch),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(mid_ch, n_channels),
+            nn.Sigmoid(),
+        )
+        # Move to same device / dtype as existing parameters
+        try:
+            ref = next(self.fc.parameters())
+            self.channel_mlp = self.channel_mlp.to(device=ref.device, dtype=ref.dtype)
+        except StopIteration:
+            pass
+
     def forward(self, x: torch.Tensor,
                 token_structure: Optional[Tuple[int, int]] = None) -> torch.Tensor:
         if token_structure is not None:
             n_ch, seq_len = token_structure
             B, T, D = x.shape
+
+            # Lazy-init channel MLP on first 4D forward if not built at init
+            if self._n_channels is None:
+                self._build_channel_mlp(n_ch)
+            elif self._n_channels != n_ch:
+                # Rebuild if channel count changed (unlikely but safe)
+                self._build_channel_mlp(n_ch)
+
             # (B, C*S, D) → (B, C, S, D) → (B*S, C, D)
             h = x.reshape(B, n_ch, seq_len, D)
             h = h.permute(0, 2, 1, 3).reshape(B * seq_len, n_ch, D)
-            # SE along C axis: pool over C, gate C
-            s = h.mean(dim=1)      # (B*S, D)
-            s = self.fc(s)         # (B*S, D)
-            h = h * s.unsqueeze(1)  # (B*S, C, D)
+
+            # Pool over D to get per-channel descriptor: (B*S, C)
+            s = h.mean(dim=2)                  # (B*S, C)
+            # Channel-axis MLP: (B*S, C) → (B*S, C) gate
+            gate = self.channel_mlp(s)         # (B*S, C) in [0,1]
+            h = h * gate.unsqueeze(2)          # (B*S, C, D) * (B*S, C, 1)
+
             # Reshape back: (B*S, C, D) → (B, S, C, D) → (B, C, S, D) → (B, C*S, D)
             h = h.reshape(B, seq_len, n_ch, D).permute(0, 2, 1, 3).reshape(B, T, D)
             return h
         else:
+            # 3D fallback: SE-on-D
             s = x.mean(dim=1)
             s = self.fc(s)
             return x * s.unsqueeze(1)
@@ -251,22 +297,28 @@ class GatedFusion(nn.Module):
     """
     Gated fusion of identity + temporal branch + spatial branch.
 
-    F = gate_t * T(H) + gate_s * S(H) + (1 - gate_t - gate_s) * H
+    Uses a 3-way softmax over [identity, temporal, spatial] logits so the
+    three weights always sum to 1.  Bias is initialized so that the identity
+    logit dominates (identity_logit=2, temporal_logit=0, spatial_logit=0)
+    giving softmax ≈ [0.71, 0.14, 0.14] — near-identity at init.
 
-    Gates are learned from H via a small FC and sigmoid, providing
-    interpretable blending weights.
+    F = w_id * H + w_t * T(H) + w_s * S(H)
 
     Returns (fused, gate_stats_dict) where gate_stats contains mean gate
     values for logging.
     """
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, identity_logit_init: float = 2.0):
         super().__init__()
-        # Project input to 2 gate scalars (temporal, spatial)
-        self.gate_proj = nn.Linear(d_model, 2)
-        # Initialize near zero so early training is close to identity
+        # Project input to 3 logits: [identity, temporal, spatial]
+        self.gate_proj = nn.Linear(d_model, 3)
+        # Initialize weights to zero so the gate depends only on bias at init
         nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)
+        # Bias: identity logit dominates, temporal and spatial start at 0
+        with torch.no_grad():
+            self.gate_proj.bias.copy_(torch.tensor(
+                [identity_logit_init, 0.0, 0.0]
+            ))
 
     def forward(self, h: torch.Tensor, t_out: torch.Tensor,
                 s_out: torch.Tensor):
@@ -277,19 +329,23 @@ class GatedFusion(nn.Module):
             s_out: spatial branch output (B, T, D)
         Returns:
             fused: (B, T, D)
-            gate_stats: dict with 'gate_temporal_mean', 'gate_spatial_mean'
+            gate_stats: dict with 'gate_identity_mean', 'gate_temporal_mean',
+                        'gate_spatial_mean'
         """
-        # Compute per-token gates from pooled representation
-        g = self.gate_proj(h.mean(dim=1))  # (B, 2)
-        g = torch.sigmoid(g)               # (B, 2) in [0, 1]
-        g_t = g[:, 0:1].unsqueeze(1)       # (B, 1, 1)
-        g_s = g[:, 1:2].unsqueeze(1)       # (B, 1, 1)
+        # Compute 3-way logits from pooled representation
+        logits = self.gate_proj(h.mean(dim=1))   # (B, 3)
+        weights = torch.softmax(logits, dim=-1)  # (B, 3), sums to 1
 
-        fused = g_t * t_out + g_s * s_out + (1 - g_t - g_s).clamp(min=0) * h
+        w_id = weights[:, 0:1].unsqueeze(1)      # (B, 1, 1)
+        w_t  = weights[:, 1:2].unsqueeze(1)      # (B, 1, 1)
+        w_s  = weights[:, 2:3].unsqueeze(1)      # (B, 1, 1)
+
+        fused = w_id * h + w_t * t_out + w_s * s_out
 
         gate_stats = {
-            'gate_temporal_mean': g[:, 0].mean().item(),
-            'gate_spatial_mean': g[:, 1].mean().item(),
+            'gate_identity_mean': weights[:, 0].mean().item(),
+            'gate_temporal_mean': weights[:, 1].mean().item(),
+            'gate_spatial_mean':  weights[:, 2].mean().item(),
         }
         return fused, gate_stats
 
@@ -317,12 +373,18 @@ def build_temporal_branch(d_model: int, branch_type: str, **kwargs) -> nn.Module
 
 
 def build_spatial_branch(d_model: int, branch_type: str, **kwargs) -> nn.Module:
-    """Build spatial branch. All branches accept optional token_structure in forward()."""
+    """Build spatial branch. All branches accept optional token_structure in forward().
+
+    Accepts optional `n_channels` kwarg for ChannelAttention to eagerly build the
+    channel-axis MLP (e.g. 16 for TUEV, 58 for DIAGNOSIS). If omitted, the MLP is
+    lazily constructed on the first forward call that provides token_structure.
+    """
     if branch_type == 'channel_attention':
         return ChannelAttention(
             d_model,
             reduction=kwargs.get('reduction', 4),
             dropout=kwargs.get('dropout', 0.1),
+            n_channels=kwargs.get('n_channels', None),
         )
     elif branch_type == 'grouped_mlp':
         return GroupedSpatialMLP(

@@ -91,8 +91,14 @@ def train_one_epoch(
         # Forward
         out = model(eeg)
         logits = out['logits']
-        z_agg = out['z_agg']
         adapter_aux = out['adapter_aux']
+
+        # Issue 6 fix: use bottleneck mu (pooled) for cc-inv, not z_agg
+        mu_last = adapter_aux.get('_mu_last')
+        if mu_last is not None:
+            mu_pooled = mu_last.mean(dim=1)  # (B, latent_dim)
+        else:
+            mu_pooled = out['z_agg']  # fallback
 
         # Loss
         loss, loss_dict = criterion(
@@ -101,7 +107,7 @@ def train_one_epoch(
             adapter_aux=adapter_aux,
             adapter=model.usba,
             subject_ids=subject_ids,
-            z_agg=z_agg,
+            z_agg=mu_pooled,
             current_epoch=current_epoch,
             beta_warmup_epochs=beta_warmup_epochs,
         )
@@ -205,6 +211,8 @@ def parse_args():
     parser.add_argument('--wandb_group', type=str, default=None)
     parser.add_argument('--save_dir', type=str, default='checkpoints_usba')
     parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--eval_test_every_epoch', action='store_true',
+                        help='Run test set every epoch (default: only at end)')
 
     # Label filtering
     parser.add_argument('--include_labels', type=int, nargs='+', default=None)
@@ -299,6 +307,10 @@ def main():
     ).to(device)
 
     # ── Loss ───────────────────────────────────────────────────────────
+    # Issue 13: pass class weights if available in dataset config
+    cw = dataset_config.get('class_weights')
+    class_weights_tensor = torch.tensor(cw, dtype=torch.float32, device=device) if cw else None
+
     criterion = USBALoss(
         beta=usba_config.beta,
         per_layer_beta=usba_config.per_layer_beta,
@@ -307,6 +319,9 @@ def main():
         enable_cc_inv=usba_config.enable_cc_inv and args.use_subjects,
         enable_budget_reg=usba_config.enable_budget_reg,
         task_type=task_type,
+        class_weights=class_weights_tensor,
+        kl_reduction=usba_config.kl_reduction,
+        budget_warmup_epochs=usba_config.budget_warmup_epochs,
     )
 
     # ── Optimizer ──────────────────────────────────────────────────────
@@ -343,7 +358,8 @@ def main():
     # ── Save dir ───────────────────────────────────────────────────────
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_name = f'best_{args.dataset}_{args.model}_usba_d{usba_config.latent_dim}.pth'
+    run_tag = args.wandb_run_name or f'{args.dataset}_{args.model}_usba_d{usba_config.latent_dim}'
+    ckpt_name = f'best_{run_tag}.pth'
 
     # ── Training loop ──────────────────────────────────────────────────
     best_val_acc = 0.0
@@ -369,52 +385,61 @@ def main():
                             average='macro', zero_division=0)
 
         # Validate
-        val_loss, val_acc, val_preds, val_labels = evaluate(
+        val_ce, val_acc, val_preds, val_labels = evaluate(
             model, data_loaders['val'], device
         )
         val_f1 = f1_score(val_labels, val_preds, average='macro', zero_division=0)
 
-        # Test
-        test_loss, test_acc, test_preds, test_labels = evaluate(
-            model, data_loaders['test'], device
-        )
-        test_f1 = f1_score(test_labels, test_preds, average='macro', zero_division=0)
+        # Test (only if flag set — saves time during training)
+        test_acc = test_f1 = test_ce = 0.0
+        if args.eval_test_every_epoch:
+            test_ce, test_acc, test_preds, test_labels = evaluate(
+                model, data_loaders['test'], device
+            )
+            test_f1 = f1_score(test_labels, test_preds, average='macro', zero_division=0)
 
         scheduler.step()
         elapsed = time.time() - t0
 
-        # Print
-        print(
+        # Print — issue 12: distinguish total_loss vs CE-only
+        line = (
             f"Epoch {epoch:3d}/{args.epochs} | "
-            f"Train: loss={train_metrics.get('total', 0):.4f} acc={train_metrics['bal_acc']:.4f} | "
-            f"Val: loss={val_loss:.4f} acc={val_acc:.4f} | "
-            f"Test: acc={test_acc:.4f} f1={test_f1:.4f} | "
+            f"Train: total={train_metrics.get('total', 0):.4f} "
+            f"ce={train_metrics.get('task', 0):.4f} "
+            f"acc={train_metrics['bal_acc']:.4f} | "
+            f"Val: ce={val_ce:.4f} acc={val_acc:.4f} | "
             f"kl={train_metrics.get('kl_total', 0):.4f} "
             f"gate={train_metrics.get('gate_mean', 0):.3f} "
             f"cc={train_metrics.get('cc_inv', 0):.4f} | "
             f"{elapsed:.1f}s"
         )
+        if args.eval_test_every_epoch:
+            line += f" | Test: acc={test_acc:.4f} f1={test_f1:.4f}"
+        print(line)
 
         # WandB
         if wandb_run:
             log_dict = {
                 'epoch': epoch,
-                'train/loss': train_metrics.get('total', 0),
-                'train/task': train_metrics.get('task', 0),
+                'train/total_loss': train_metrics.get('total', 0),
+                'train/ce_loss': train_metrics.get('task', 0),
                 'train/kl': train_metrics.get('kl_total', 0),
                 'train/cc_inv': train_metrics.get('cc_inv', 0),
                 'train/budget': train_metrics.get('budget', 0),
                 'train/gate_mean': train_metrics.get('gate_mean', 0),
                 'train/bal_acc': train_metrics['bal_acc'],
                 'train/f1_macro': train_f1,
-                'val/loss': val_loss,
+                'val/ce_loss': val_ce,
                 'val/bal_acc': val_acc,
                 'val/f1_macro': val_f1,
-                'test/loss': test_loss,
-                'test/bal_acc': test_acc,
-                'test/f1_macro': test_f1,
                 'lr': optimizer.param_groups[0]['lr'],
             }
+            if args.eval_test_every_epoch:
+                log_dict.update({
+                    'test/ce_loss': test_ce,
+                    'test/bal_acc': test_acc,
+                    'test/f1_macro': test_f1,
+                })
             wandb_run.log(log_dict)
 
         # Best model

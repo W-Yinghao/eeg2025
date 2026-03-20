@@ -284,7 +284,7 @@ DATASET_CONFIGS = {
         'num_classes': 4,
         'task_type': 'multiclass',
         'n_channels': 58,
-        'sampling_rate': 200,  # Resampled to 200Hz (matching patch_size=200)
+        'sampling_rate': 250,  # Raw data is 250Hz; will be resampled to 200Hz at load time
         'segment_duration': 5,  # seconds (seq_len=5, matching TUEV/AD_DIAGNOSIS)
         'patch_size': 200,
         'label_names': {
@@ -993,6 +993,9 @@ class EEGLMDBDataset(Dataset):
         n_samples = signal.shape[1]
         seq_len = n_samples // self.target_patch_size
 
+        # Target seq_len from config (segment_duration * 200Hz / patch_size)
+        target_seq_len = int(self.config.get('segment_duration', 5) * 200 / self.target_patch_size)
+
         # Handle case where segment is too short for even 1 patch
         if seq_len == 0:
             # Pad to at least 1 patch
@@ -1003,6 +1006,14 @@ class EEGLMDBDataset(Dataset):
             # Reshape for CBraMod: (n_channels, n_samples) -> (n_channels, seq_len, patch_size)
             signal = signal[:, :seq_len * self.target_patch_size]
             signal = signal.reshape(self.target_n_channels, seq_len, self.target_patch_size)
+
+        # Pad or truncate to target_seq_len so all samples have uniform shape
+        if signal.shape[1] < target_seq_len:
+            padded = np.zeros((self.target_n_channels, target_seq_len, self.target_patch_size), dtype=np.float32)
+            padded[:, :signal.shape[1], :] = signal
+            signal = padded
+        elif signal.shape[1] > target_seq_len:
+            signal = signal[:, :target_seq_len, :]
 
         # Normalize (divide by 100 as in original CBraMod)
         signal = signal / 100.0

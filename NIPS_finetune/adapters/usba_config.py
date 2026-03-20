@@ -71,6 +71,12 @@ class USBAConfig:
     log_kl_per_layer: bool = True
     log_budget_stats: bool = True
 
+    # ── KL reduction ─────────────────────────────────────────────────
+    kl_reduction: str = 'mean'  # 'mean' (KL per token) or 'total' (sum over tokens)
+
+    # ── Budget warmup ────────────────────────────────────────────────
+    budget_warmup_epochs: int = 10  # budget reg is zero before this epoch, then ramps
+
     # ── Dropout ────────────────────────────────────────────────────────
     dropout: float = 0.1
 
@@ -124,6 +130,11 @@ class USBAConfig:
         g.add_argument('--usba_selected_layers', type=str, default='output',
                         help='Layer selection: "output", "all", or comma-separated ints')
         g.add_argument('--usba_dropout', type=float, default=0.1)
+        g.add_argument('--usba_kl_reduction', type=str, default='mean',
+                        choices=['mean', 'total'],
+                        help='KL reduction: mean (per token) or total (sum)')
+        g.add_argument('--usba_budget_warmup', type=int, default=10,
+                        help='Budget regularization warmup epochs')
         return parser
 
     @classmethod
@@ -152,4 +163,6 @@ class USBAConfig:
             enable_budget_reg=not getattr(args, 'usba_no_budget', False),
             factorized=not getattr(args, 'usba_no_factorize', False),
             dropout=getattr(args, 'usba_dropout', 0.1),
+            kl_reduction=getattr(args, 'usba_kl_reduction', 'mean'),
+            budget_warmup_epochs=getattr(args, 'usba_budget_warmup', 10),
         )

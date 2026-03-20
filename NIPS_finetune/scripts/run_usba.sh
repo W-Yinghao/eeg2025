@@ -9,10 +9,10 @@
 # USBA Fine-Tuning: CBraMod / CodeBrain / LUNA
 #
 # Usage:
-#   ./run_usba.sh                      # All models x all datasets
-#   ./run_usba.sh codebrain            # CodeBrain on all datasets
-#   ./run_usba.sh cbramod TUEV         # CBraMod on TUEV only
-#   ./run_usba.sh all DIAGNOSIS        # All models on DIAGNOSIS only
+#   ./run_usba.sh MODEL DATASET LAYERS [RUN_NAME]
+#   WANDB_GROUP=tusz_place ./run_usba.sh cbramod TUSZ 10,11 tusz_last2
+#   WANDB_GROUP=tusz_place ./run_usba.sh cbramod TUSZ 9,10,11 tusz_last3
+#   WANDB_GROUP=tusz_place ./run_usba.sh cbramod TUSZ all tusz_alllayers
 ################################################################################
 
 set -e
@@ -31,7 +31,7 @@ LOG_DIR="${PROJECT_DIR}/logs_usba"
 CHECKPOINT_DIR="${PROJECT_DIR}/checkpoints_usba"
 
 # WandB
-WANDB_PROJECT="eeg_usba"
+WANDB_PROJECT="eeg_usba_v2"
 
 # GPU
 CUDA_DEVICE=0
@@ -47,6 +47,9 @@ USBA_LATENT_DIM=64
 USBA_BETA=1e-4
 USBA_LAMBDA_CC=0.01
 USBA_ETA_BUDGET=1e-3
+
+# USBA layer selection (passed from CLI)
+WANDB_GROUP="${WANDB_GROUP:-}"
 
 # ============================================================================
 # Models
@@ -107,19 +110,22 @@ get_dataset_param() {
 run_experiment() {
     local model=$1
     local dataset=$2
+    local selected_layers=${3:-"output"}
+    local custom_run_name=$4
+    shift 4 2>/dev/null || true
+    local extra_args="$*"
 
     local lr=$(get_dataset_param "${dataset}" "LR")
     local weight_decay=$(get_dataset_param "${dataset}" "WEIGHT_DECAY")
     local dropout=$(get_dataset_param "${dataset}" "DROPOUT")
     local batch_size=$(get_dataset_param "${dataset}" "BATCH_SIZE")
 
-    local timestamp=$(date +"%Y%m%d_%H%M%S")
-    local run_name="USBA_${model}_${dataset}_${timestamp}"
+    local run_name="${custom_run_name:-USBA_${model}_${dataset}_$(date +%Y%m%d_%H%M%S)}"
     local log_file="${LOG_DIR}/${run_name}.log"
 
     echo ""
     echo "======================================================================"
-    echo "USBA: ${model} / ${dataset}"
+    echo "USBA: ${model} / ${dataset} / layers=${selected_layers}"
     echo "======================================================================"
     echo "  LR: ${lr}  WD: ${weight_decay}  Dropout: ${dropout}  BS: ${batch_size}"
     echo "  USBA: latent=${USBA_LATENT_DIM} beta=${USBA_BETA} lambda_cc=${USBA_LAMBDA_CC} eta=${USBA_ETA_BUDGET}"
@@ -153,14 +159,17 @@ run_experiment() {
         --dropout ${dropout} \
         --patience ${PATIENCE} \
         --save_dir ${CHECKPOINT_DIR} \
+        --eval_test_every_epoch \
         --usba \
         --usba_latent_dim ${USBA_LATENT_DIM} \
         --usba_beta ${USBA_BETA} \
         --usba_lambda_cc ${USBA_LAMBDA_CC} \
         --usba_eta_budget ${USBA_ETA_BUDGET} \
+        --usba_selected_layers ${selected_layers} \
         --wandb_project ${WANDB_PROJECT} \
+        ${WANDB_GROUP:+--wandb_group ${WANDB_GROUP}} \
         --wandb_run_name ${run_name} \
-        ${model_args}"
+        ${model_args} ${extra_args}"
 
     echo "Starting training..."
     cd "${PROJECT_DIR}"
@@ -178,71 +187,41 @@ run_experiment() {
 # ============================================================================
 
 main() {
-    local arg_model="${1:-all}"
-    local arg_dataset="${2:-all}"
+    local arg_model="${1:-cbramod}"
+    local arg_dataset="${2:-TUSZ}"
+    local arg_layers="${3:-output}"
+    local arg_run_name="${4:-}"
+    shift 4 2>/dev/null || true
+    local extra_args="$*"
 
-    # Resolve model list
-    local models=()
-    if [ "${arg_model}" = "all" ]; then
-        models=("${ALL_MODELS[@]}")
-    else
-        models=("${arg_model}")
-    fi
-
-    # Resolve dataset list
-    local datasets=()
-    if [ "${arg_dataset}" = "all" ]; then
-        datasets=("${ALL_DATASETS[@]}")
-    else
-        datasets=("${arg_dataset}")
-    fi
-
-    local total=$(( ${#models[@]} * ${#datasets[@]} ))
     echo "======================================================================"
     echo "USBA Fine-Tuning"
     echo "======================================================================"
-    echo "  Models:   ${models[*]}"
-    echo "  Datasets: ${datasets[*]}"
-    echo "  Total:    ${total} experiments"
+    echo "  Model:   ${arg_model}"
+    echo "  Dataset: ${arg_dataset}"
+    echo "  Layers:  ${arg_layers}"
+    [ -n "${extra_args}" ] && echo "  Extra:   ${extra_args}"
     echo "======================================================================"
 
     setup_directories
 
-    local success=0
-    local fail=0
-    local count=0
-
-    for model in "${models[@]}"; do
-        for dataset in "${datasets[@]}"; do
-            count=$((count + 1))
-            if run_experiment "${model}" "${dataset}"; then
-                success=$((success + 1))
-            else
-                fail=$((fail + 1))
-            fi
-            echo "Progress: ${count}/${total} (${success} ok, ${fail} failed)"
-        done
-    done
-
-    echo ""
-    echo "======================================================================"
-    echo "Done: ${success}/${total} succeeded, ${fail} failed"
-    echo "  Logs:        ${LOG_DIR}/"
-    echo "  Checkpoints: ${CHECKPOINT_DIR}/"
-    echo "======================================================================"
+    run_experiment "${arg_model}" "${arg_dataset}" "${arg_layers}" "${arg_run_name}" ${extra_args}
 }
 
 show_usage() {
-    echo "Usage: $0 [MODEL] [DATASET]"
+    echo "Usage: $0 MODEL DATASET LAYERS [RUN_NAME] [EXTRA_ARGS...]"
     echo ""
-    echo "  MODEL:   cbramod | codebrain | luna | all (default: all)"
-    echo "  DATASET: TUEV | TUAB | TUSZ | DIAGNOSIS | all (default: all)"
+    echo "  MODEL:      cbramod | codebrain | luna"
+    echo "  DATASET:    TUEV | TUAB | TUSZ | DIAGNOSIS"
+    echo "  LAYERS:     e.g. 10,11 | 9,10,11 | all | output"
+    echo "  RUN_NAME:   custom wandb run name (optional)"
+    echo "  EXTRA_ARGS: additional flags passed to train_usba.py"
+    echo ""
+    echo "  Set WANDB_GROUP env var for wandb grouping."
     echo ""
     echo "Examples:"
-    echo "  $0                       # all models x all datasets"
-    echo "  $0 codebrain             # CodeBrain on all datasets"
-    echo "  $0 cbramod DIAGNOSIS     # CBraMod on DIAGNOSIS only"
-    echo "  $0 all TUEV              # All models on TUEV"
+    echo "  WANDB_GROUP=tusz_place $0 cbramod TUSZ 10,11 tusz_last2"
+    echo "  WANDB_GROUP=tuev_diag $0 cbramod TUEV output tuev_adapter_ce --no_subjects --usba_no_cc_inv --usba_no_budget --usba_beta 0"
 }
 
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then

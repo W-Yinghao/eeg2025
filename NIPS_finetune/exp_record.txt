@@ -61,17 +61,18 @@
 748105 run_full_finetune.sh cbramod TUEV
 748106 run_full_finetune.sh cbramod TUAB
 748107 run_full_finetune.sh cbramod TUSZ
-748108 run_full_finetune.sh cbramod DIAGNOSIS
+749026 run_full_finetune.sh cbramod DIAGNOSIS
 
 748109 run_full_finetune.sh codebrain TUEV
 748110 run_full_finetune.sh codebrain TUAB
 748111 run_full_finetune.sh codebrain TUSZ
-748112 run_full_finetune.sh codebrain DIAGNOSIS
+749024 run_full_finetune.sh codebrain DIAGNOSIS
 
 748114 run_full_finetune.sh luna TUEV
+done 0.60321
 748115 run_full_finetune.sh luna TUAB
 748116 run_full_finetune.sh luna TUSZ
-748117 run_full_finetune.sh luna DIAGNOSIS
+749027 run_full_finetune.sh luna DIAGNOSIS
 
 
 TODO
@@ -80,11 +81,13 @@ Full USBA with WandB:
 
 
 conda run -n eeg2025 python train_usba.py \
-    --dataset AD_DIAGNOSIS --model cbramod --usba \
+    --dataset DIAGNOSIS --model cbramod --usba \
     --usba_latent_dim 64 --usba_beta 1e-4 \
     --usba_lambda_cc 0.01 --usba_eta_budget 1e-3 \
     --wandb_project eeg_usba --cuda 0
-
+749134 cbramod tuab
+749181 cbramod tuev
+749127 cbramod tusz
 Ablation: no factorization:
 
 
@@ -103,3 +106,30 @@ SPCBA: Interface reserved; needs dual-latent (z_d/z_s) split in bottleneck
 Per-layer beta schedule: Config field exists, not yet tied to a schedule function
 Class weights: Config supports it, but auto-computation from dataset not yet wired
 DDP: Code is single-GPU; USBAInjectedModel is compatible with nn.DataParallel
+
+
+*************03/13***********
+WANDB_GROUP=tusz_place sbatch run_usba.sh cbramod TUSZ all tusz_alllayers
+749623
+WANDB_GROUP=tusz_place sbatch run_usba.sh cbramod TUSZ 9,10,11 tusz_last3
+749622
+WANDB_GROUP=tusz_place sbatch run_usba.sh cbramod TUSZ 10,11 tusz_last2
+749621
+
+
+WANDB_GROUP=tuev_diag sbatch run_usba.sh cbramod TUEV output tuev_adapter_ce \
+  --no_subjects --usba_no_cc_inv --usba_no_budget --usba_beta 0
+Submitted batch job 749702
+
+WANDB_GROUP=tuev_diag sbatch run_usba.sh cbramod TUEV output tuev_adapter_ib \
+  --no_subjects --usba_no_cc_inv --usba_no_budget --usba_beta 1e-4
+Submitted batch job 749703
+
+
+WANDB_GROUP=tuev_diag sbatch run_usba.sh cbramod TUEV output tuev_adapter_ib_budget \
+  --no_subjects --usba_no_cc_inv
+Submitted batch job 749704
+
+WANDB_GROUP=tuev_diag sbatch run_usba.sh cbramod TUEV output tuev_subject_no_cc \
+  --usba_no_cc_inv
+Submitted batch job 749705

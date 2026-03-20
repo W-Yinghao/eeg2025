@@ -82,21 +82,23 @@ class USBAInjectedModel(nn.Module):
                 p.requires_grad = False
 
         # ── Create USBA adapter(s) ─────────────────────────────────────
+        # Pass n_channels so ChannelAttention can eagerly build its MLP
+        _n_ch = n_channels if self._token_structure is not None else None
         if config.selected_layers == 'output' or self._backbone_type in ('codebrain', 'femba', 'luna'):
             # Single adapter after backbone output
-            self.usba = USBAAdapter(token_dim, config, num_layers=1)
+            self.usba = USBAAdapter(token_dim, config, num_layers=1, n_channels=_n_ch)
             self._injection_mode = 'output'
         elif config.selected_layers == 'all':
             # One adapter per backbone layer (CBraMod only for now)
             n_backbone_layers = self._count_backbone_layers()
-            self.usba = USBAAdapter(token_dim, config, num_layers=n_backbone_layers)
+            self.usba = USBAAdapter(token_dim, config, num_layers=n_backbone_layers, n_channels=_n_ch)
             self._injection_mode = 'inter_layer'
         elif isinstance(config.selected_layers, list):
-            self.usba = USBAAdapter(token_dim, config, num_layers=len(config.selected_layers))
+            self.usba = USBAAdapter(token_dim, config, num_layers=len(config.selected_layers), n_channels=_n_ch)
             self._injection_mode = 'selected_layers'
             self._selected_indices = set(config.selected_layers)
         else:
-            self.usba = USBAAdapter(token_dim, config, num_layers=1)
+            self.usba = USBAAdapter(token_dim, config, num_layers=1, n_channels=_n_ch)
             self._injection_mode = 'output'
 
         # ── Classification head ────────────────────────────────────────
@@ -177,6 +179,7 @@ class USBAInjectedModel(nn.Module):
 
         layers = inner.encoder.layers
         usba_layer_idx = 0
+        last_layer_aux = {}  # preserve real bottleneck mu/z from last injected layer
 
         for i, layer in enumerate(layers):
             with torch.no_grad():
@@ -201,6 +204,7 @@ class USBAInjectedModel(nn.Module):
                 all_kls.append(aux['_kl'])
                 all_gate_vals.append(aux['_gate_value'])
                 all_aux.update({k: v for k, v in aux.items() if not k.startswith('_')})
+                last_layer_aux = aux  # keep real mu/z from the last injected layer
                 usba_layer_idx += 1
 
         # proj_out (identity in our setup)
@@ -213,6 +217,9 @@ class USBAInjectedModel(nn.Module):
         all_aux['gate_mean'] = sum(all_gate_vals) / len(all_gate_vals) if all_gate_vals else 0.0
         all_aux['_all_kls'] = all_kls
         all_aux['_all_gate_vals'] = all_gate_vals
+        # Issue 7 fix: preserve real bottleneck latent from last injected layer
+        all_aux['_z_last'] = last_layer_aux.get('_z')
+        all_aux['_mu_last'] = last_layer_aux.get('_mu')
 
         return h, all_aux
 
@@ -237,13 +244,9 @@ class USBAInjectedModel(nn.Module):
         B = x.shape[0]
 
         if self._injection_mode in ('inter_layer', 'selected_layers') and self._backbone_type == 'cbramod':
-            # Inter-layer injection path
+            # Inter-layer injection path — _z_last/_mu_last already set from real bottleneck
             backbone_out, adapter_aux = self._backbone_inter_layer_forward(x)
-            # Reshape to tokens
             H = backbone_out.reshape(B, -1, self.token_dim)  # (B, T, D)
-            # z for downstream is the last layer's representation
-            adapter_aux['_z_last'] = H[:, :, :self.config.latent_dim] if H.shape[-1] > self.config.latent_dim else H
-            adapter_aux['_mu_last'] = adapter_aux.get('_z_last', H)
         else:
             # Output-mode injection
             backbone_out = self._backbone_forward(x)

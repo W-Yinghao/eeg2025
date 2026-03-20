@@ -41,7 +41,7 @@ class Model(nn.Module):
     def forward(self, x):
         bz, ch_num, seq_len, patch_size = x.shape
         feats = self.backbone(x)
-        feats = feats.contiguous().view(bz, ch_num * seq_len, patch_size)
+        feats = feats.contiguous().view(bz, ch_num * seq_len * patch_size)
         out = self.classifier(feats)
         out = out.contiguous().view(bz)
         return out

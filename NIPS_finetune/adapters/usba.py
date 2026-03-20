@@ -37,7 +37,8 @@ class USBALayer(nn.Module):
     Returns (H_adapt, aux_dict).
     """
 
-    def __init__(self, d_model: int, config: USBAConfig, layer_idx: int = 0):
+    def __init__(self, d_model: int, config: USBAConfig, layer_idx: int = 0,
+                 n_channels: Optional[int] = None):
         super().__init__()
         self.d_model = d_model
         self.layer_idx = layer_idx
@@ -59,6 +60,7 @@ class USBALayer(nn.Module):
                 config.spatial_branch_type,
                 reduction=config.spatial_reduction,
                 dropout=config.dropout,
+                n_channels=n_channels,
             )
             # (3) Gated fusion
             self.fusion = GatedFusion(d_model)
@@ -142,12 +144,14 @@ class USBAAdapter(nn.Module):
       - Mean pooling for downstream classification
     """
 
-    def __init__(self, d_model: int, config: USBAConfig, num_layers: int = 1):
+    def __init__(self, d_model: int, config: USBAConfig, num_layers: int = 1,
+                 n_channels: Optional[int] = None):
         """
         Args:
             d_model: token dimension (e.g. 200 for CBraMod/CodeBrain)
             config: USBAConfig
             num_layers: number of USBA layers to create
+            n_channels: EEG channel count for eager ChannelAttention init
         """
         super().__init__()
         self.config = config
@@ -155,7 +159,7 @@ class USBAAdapter(nn.Module):
         self.d_model = d_model
 
         self.layers = nn.ModuleList([
-            USBALayer(d_model, config, layer_idx=i)
+            USBALayer(d_model, config, layer_idx=i, n_channels=n_channels)
             for i in range(num_layers)
         ])
 

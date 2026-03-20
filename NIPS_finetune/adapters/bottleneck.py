@@ -28,7 +28,8 @@ class VariationalBottleneck(nn.Module):
 
     Gate types:
       - 'layer_wise': single scalar g per adapter layer
-      - 'token_wise': g of shape (1, T, 1) — one gate per token position
+      - 'token_wise': g of shape (B, T, 1) — one gate per token position,
+            produced by a small projection from the fused input
       - 'channel_wise': g of shape (1, 1, D) — one gate per channel
     """
 
@@ -57,9 +58,16 @@ class VariationalBottleneck(nn.Module):
 
         # ── Decoder: project up to input dim ───────────────────────────
         self.decoder = nn.Linear(latent_dim, input_dim)
-        # Zero-init decoder so adapter starts as identity
-        nn.init.zeros_(self.decoder.weight)
-        nn.init.zeros_(self.decoder.bias)
+        # Bug-4 fix: use small random weights instead of zeros so that
+        # task gradients can reach the encoder/branches through the decoder
+        # from the very first step.
+        nn.init.normal_(self.decoder.weight, std=0.02)
+        nn.init.normal_(self.decoder.bias, std=0.02)
+
+        # Learned scalar that multiplies delta.  Initialized to 0 so that
+        # the adapter still starts as near-identity (scale * delta ≈ 0),
+        # but gradients flow through the decoder immediately.
+        self.residual_scale = nn.Parameter(torch.tensor(0.0))
 
         # ── Residual gate ──────────────────────────────────────────────
         # Learnable gate initialized near gate_init (passed through sigmoid)
@@ -67,19 +75,34 @@ class VariationalBottleneck(nn.Module):
         if gate_type == 'layer_wise':
             self.gate_logit = nn.Parameter(torch.tensor(gate_init))
         elif gate_type == 'token_wise':
-            # Will be expanded to match T at runtime
-            self.gate_logit = nn.Parameter(torch.full((1,), gate_init))
+            # Bug-1 fix: a real per-token gate produced by projecting
+            # the fused input to a scalar per token position.
+            gate_hidden = max(input_dim // 4, 1)
+            self.gate_proj = nn.Sequential(
+                nn.Linear(input_dim, gate_hidden),
+                nn.GELU(),
+                nn.Linear(gate_hidden, 1),
+            )
+            # Initialize the final projection bias so that the initial
+            # output is close to gate_init (before sigmoid).
+            nn.init.zeros_(self.gate_proj[-1].weight)
+            nn.init.constant_(self.gate_proj[-1].bias, gate_init)
         elif gate_type == 'channel_wise':
             self.gate_logit = nn.Parameter(torch.full((input_dim,), gate_init))
         else:
             raise ValueError(f"Unknown gate_type: {gate_type}")
 
-    def _get_gate(self, B: int, T: int, D: int) -> torch.Tensor:
-        """Compute gate value with appropriate shape for broadcasting."""
+    def _get_gate(self, fused: torch.Tensor, B: int, T: int, D: int) -> torch.Tensor:
+        """Compute gate value with appropriate shape for broadcasting.
+
+        Args:
+            fused: the fused input tensor (B, T, D), used only by token_wise.
+        """
         if self.gate_type == 'layer_wise':
             return torch.sigmoid(self.gate_logit)  # scalar
         elif self.gate_type == 'token_wise':
-            return torch.sigmoid(self.gate_logit).unsqueeze(0).unsqueeze(-1)  # (1, 1, 1)
+            # Project fused input to per-token gate: (B, T, 1)
+            return torch.sigmoid(self.gate_proj(fused))  # (B, T, 1)
         elif self.gate_type == 'channel_wise':
             return torch.sigmoid(self.gate_logit).unsqueeze(0).unsqueeze(0)  # (1, 1, D)
 
@@ -117,11 +140,12 @@ class VariationalBottleneck(nn.Module):
         else:
             z = mu
 
-        # Decode
-        delta = self.decoder(z)  # (B, T, D)
+        # Decode — residual_scale preserves near-identity init while
+        # allowing gradients to flow through the decoder from step 1.
+        delta = self.residual_scale * self.decoder(z)  # (B, T, D)
 
         # Gate
-        g = self._get_gate(B, T, D)
+        g = self._get_gate(fused, B, T, D)
 
         # Write back to residual stream
         h_adapted = h_original + g * delta
@@ -133,9 +157,10 @@ class VariationalBottleneck(nn.Module):
         with torch.no_grad():
             if self.gate_type == 'layer_wise':
                 gate_val = torch.sigmoid(self.gate_logit).item()
+            elif self.gate_type == 'token_wise':
+                # g is (B, T, 1); report its mean for logging
+                gate_val = g.mean().item()
             elif self.gate_type == 'channel_wise':
-                gate_val = torch.sigmoid(self.gate_logit).mean().item()
-            else:
                 gate_val = torch.sigmoid(self.gate_logit).mean().item()
 
         aux = {

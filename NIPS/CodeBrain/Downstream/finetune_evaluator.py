@@ -53,8 +53,9 @@ class Evaluator:
         preds = np.array(preds)
         scores = np.array(scores)
         acc = balanced_accuracy_score(truths, preds)
+        kappa = cohen_kappa_score(truths, preds)
         roc_auc = roc_auc_score(truths, scores)
         precision, recall, thresholds = precision_recall_curve(truths, scores, pos_label=1)
         pr_auc = auc(recall, precision)
         cm = confusion_matrix(truths, preds)
-        return acc, pr_auc, roc_auc, cm
+        return acc, kappa, pr_auc, roc_auc, cm
