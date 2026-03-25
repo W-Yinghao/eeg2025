@@ -38,7 +38,7 @@ for DATASET in "${DATASETS[@]}"; do
             sbatch \
                 --job-name="${JOB_NAME}" \
                 --output="${LOG_FILE}" \
-                --export="ALL,WANDB_MODE=disabled" \
+                --export="ALL" \
                 "${SCRIPT}" "${MODEL}" "${DATASET}" "${FT}" "${SEED}"
 
             COUNT=$((COUNT + 1))
