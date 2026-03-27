@@ -24,7 +24,7 @@
 set -e
 
 module purge
-module load pytorch-gpu/py3/2.6.0
+module load pytorch-gpu/py3/2.8.0
 export PYTHONUSERBASE=$WORK/.local_pt260
 export WANDB_MODE=offline
 
