@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --hint=nomultithread
-#SBATCH --time=25:00:00
+#SBATCH --time=20:00:00
 #SBATCH -A ifd@v100
 #SBATCH -C v100-32g
 #SBATCH --signal=B:USR1@120
