@@ -35,6 +35,10 @@ class EEGAugmentor(nn.Module):
         jitter_std: float = 0.05,
         mask_ratio: float = 0.1,
         p_each: float = 0.5,
+        # Per-augmentation probabilities (None → fall back to p_each)
+        p_time_shift: float = None,
+        p_jitter: float = None,
+        p_mask: float = None,
     ):
         super().__init__()
         self.enable_time_shift = enable_time_shift
@@ -44,6 +48,9 @@ class EEGAugmentor(nn.Module):
         self.jitter_std = jitter_std
         self.mask_ratio = mask_ratio
         self.p_each = p_each
+        self.p_time_shift = p_time_shift if p_time_shift is not None else p_each
+        self.p_jitter = p_jitter if p_jitter is not None else p_each
+        self.p_mask = p_mask if p_mask is not None else p_each
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -58,13 +65,13 @@ class EEGAugmentor(nn.Module):
         """
         x_aug = x.clone()
 
-        if self.enable_time_shift and torch.rand(1).item() < self.p_each:
+        if self.enable_time_shift and torch.rand(1).item() < self.p_time_shift:
             x_aug = self._time_shift(x_aug)
 
-        if self.enable_amplitude_jitter and torch.rand(1).item() < self.p_each:
+        if self.enable_amplitude_jitter and torch.rand(1).item() < self.p_jitter:
             x_aug = self._amplitude_jitter(x_aug)
 
-        if self.enable_time_mask and torch.rand(1).item() < self.p_each:
+        if self.enable_time_mask and torch.rand(1).item() < self.p_mask:
             x_aug = self._time_mask(x_aug)
 
         return x_aug

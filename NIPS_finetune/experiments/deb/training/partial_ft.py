@@ -63,6 +63,7 @@ def get_backbone_blocks(backbone: nn.Module, model_type: str) -> List[nn.Module]
 REGIME_MAP = {
     'frozen': 0,
     'top1': 1,
+    'top1_gentle': 1,  # alias: same unfreezing as top1, used with gentler LR/schedule
     'top2': 2,
     'top4': 4,
     'full': -1,  # sentinel: all blocks

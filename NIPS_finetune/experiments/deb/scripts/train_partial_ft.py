@@ -52,6 +52,7 @@ from experiments.deb.data.batch_protocol import load_deb_data
 from experiments.deb.models.backbone_wrapper import BackboneWrapper
 from experiments.deb.models.selector_model import SelectorModel
 from experiments.deb.training.selector_trainer import SelectorTrainer
+from experiments.deb.training.partial_ft import compute_param_summary, print_param_summary
 
 
 def parse_args():
@@ -71,7 +72,7 @@ def parse_args():
 
     # True partial FT regime
     parser.add_argument('--regime', type=str, default='frozen',
-                        choices=['frozen', 'top1', 'top2', 'top4', 'full'],
+                        choices=['frozen', 'top1', 'top1_gentle', 'top2', 'top4', 'full'],
                         help='Partial FT regime: how many top backbone blocks to unfreeze')
     parser.add_argument('--freeze_patch_embed', action='store_true', default=True)
     parser.add_argument('--no_freeze_patch_embed', dest='freeze_patch_embed',
@@ -89,6 +90,14 @@ def parse_args():
     parser.add_argument('--label_smoothing', type=float, default=0.0)
     parser.add_argument('--scheduler', type=str, default='cosine',
                         choices=['cosine', 'none'])
+    parser.add_argument('--warmup_epochs', type=int, default=0,
+                        help='Linear LR warmup epochs before cosine decay (0=no warmup)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to resume checkpoint (.pth) or directory to auto-detect')
+
+    # Mixed precision
+    parser.add_argument('--amp', action='store_true', default=False,
+                        help='Enable automatic mixed precision (AMP) training')
 
     # Head config
     parser.add_argument('--head_type', type=str, default='pool',
@@ -119,6 +128,12 @@ def parse_args():
     parser.add_argument('--aug_jitter_std', type=float, default=0.05)
     parser.add_argument('--aug_mask_ratio', type=float, default=0.1)
     parser.add_argument('--aug_time_shift_max', type=int, default=1)
+    parser.add_argument('--aug_p_time_shift', type=float, default=None,
+                        help='Probability of time shift (None=use default 0.5)')
+    parser.add_argument('--aug_p_jitter', type=float, default=None,
+                        help='Probability of amplitude jitter (None=use default 0.5)')
+    parser.add_argument('--aug_p_mask', type=float, default=None,
+                        help='Probability of time mask (None=use default 0.5)')
 
     # VIB extension (disabled by default)
     parser.add_argument('--enable_vib', action='store_true',
@@ -151,6 +166,19 @@ def parse_args():
     parser.add_argument('--include_labels', type=int, nargs='+', default=None)
     parser.add_argument('--exclude_labels', type=int, nargs='+', default=None)
 
+    # Staged partial FT (Exp 6B P3)
+    parser.add_argument('--staged_partial', action='store_true',
+                        help='Two-stage partial FT: stage1 (top1 partial) -> stage2 (frozen head-only)')
+    parser.add_argument('--stage1_epochs', type=int, default=1,
+                        help='Number of epochs for stage1 (partial FT warm-start)')
+    parser.add_argument('--stage1_lr_head', type=float, default=1e-3)
+    parser.add_argument('--stage1_lr_backbone', type=float, default=1e-5)
+    parser.add_argument('--stage1_warmup_epochs', type=int, default=1)
+    parser.add_argument('--stage2_epochs', type=int, default=20)
+    parser.add_argument('--stage2_lr_head', type=float, default=5e-4)
+    parser.add_argument('--stage2_warmup_epochs', type=int, default=2)
+    parser.add_argument('--stage2_patience', type=int, default=6)
+
     return parser.parse_args()
 
 
@@ -162,8 +190,17 @@ def main():
     cfg['enable_temporal_gate'] = not args.no_temporal_gate
     cfg['enable_frequency_gate'] = not args.no_frequency_gate
 
-    if cfg.get('lr_backbone') is None:
-        cfg['lr_backbone'] = cfg['lr_head'] / cfg['lr_ratio']
+    staged = cfg.get('staged_partial', False)
+
+    if staged:
+        # For staged mode, use stage1 LRs for initial optimizer setup
+        cfg['lr_head'] = cfg.get('stage1_lr_head', 1e-3)
+        cfg['lr_backbone'] = cfg.get('stage1_lr_backbone', 1e-5)
+        cfg['warmup_epochs'] = cfg.get('stage1_warmup_epochs', 1)
+        cfg['epochs'] = cfg.get('stage1_epochs', 1)
+    else:
+        if cfg.get('lr_backbone') is None:
+            cfg['lr_backbone'] = cfg['lr_head'] / cfg['lr_ratio']
 
     setup_seed(cfg['seed'])
     device = torch.device(f"cuda:{cfg['cuda']}" if torch.cuda.is_available() else 'cpu')
@@ -220,15 +257,100 @@ def main():
         cfg=cfg,
     )
 
-    # Train
-    trainer = SelectorTrainer(
-        model=model,
-        cfg=cfg,
-        data_loaders=data_loaders,
-        dataset_config=dataset_config,
-        device=device,
-    )
-    trainer.train()
+    if staged:
+        # ── Staged partial FT: stage1 (partial) → stage2 (frozen) ──
+        save_dir = cfg['save_dir']
+        stage1_flag = os.path.join(
+            save_dir,
+            f".stage1_done_{cfg['dataset']}_{cfg.get('model','codebrain')}_s{cfg['seed']}")
+
+        stage2_cfg_patch = {
+            'epochs': cfg.get('stage2_epochs', 20),
+            'lr_head': cfg.get('stage2_lr_head', 5e-4),
+            'lr_backbone': 0.0,
+            'warmup_epochs': cfg.get('stage2_warmup_epochs', 2),
+            'patience': cfg.get('stage2_patience', 6),
+            'scheduler': 'cosine',
+            'regime': 'staged_partial',
+        }
+
+        if os.path.exists(stage1_flag):
+            # ── Resume into stage2 (stage1 already done) ──
+            print(f"\n[Resume-Staged] Stage1 marker found — skipping to stage2")
+            print(f"  Marker: {stage1_flag}")
+
+            # Recreate model with frozen backbone for stage2
+            cfg['regime'] = 'frozen'
+            cfg.update(stage2_cfg_patch)
+            model = SelectorModel(
+                backbone_wrapper=bb_wrapper, mode=cfg['mode'],
+                num_classes=num_classes, cfg=cfg,
+            )
+            model.regime = 'staged_partial'
+            model.regime_info['regime'] = 'staged_partial'
+
+            # Trainer __init__ will auto-load resume checkpoint via --resume
+            trainer = SelectorTrainer(
+                model=model, cfg=cfg, data_loaders=data_loaders,
+                dataset_config=dataset_config, device=device,
+            )
+            trainer.train()
+
+        else:
+            # ── First run: stage1 → stage2 ──
+            print(f"\n{'='*70}")
+            print(f"  Exp 6B: Staged Partial Fine-Tuning")
+            print(f"  Stage1: {cfg['stage1_epochs']} ep, "
+                  f"lr_bb={cfg['stage1_lr_backbone']:.1e}, "
+                  f"lr_head={cfg['stage1_lr_head']:.1e}")
+            print(f"  Stage2: {stage2_cfg_patch['epochs']} ep, "
+                  f"lr_head={stage2_cfg_patch['lr_head']:.1e}, frozen backbone")
+            print(f"{'='*70}")
+
+            # Don't resume during stage1 (it's cheap to redo)
+            cfg_no_resume = cfg.copy()
+            cfg_no_resume['resume'] = None
+            trainer = SelectorTrainer(
+                model=model, cfg=cfg_no_resume, data_loaders=data_loaders,
+                dataset_config=dataset_config, device=device,
+            )
+            trainer.train_stage(cfg.get('stage1_epochs', 1),
+                                stage_name='Stage1-PartialFT')
+
+            # Freeze backbone for stage 2
+            for p in model.backbone_wrapper.parameters():
+                p.requires_grad = False
+
+            model.regime = 'staged_partial'
+            model.regime_info = {
+                'regime': 'staged_partial',
+                'n_blocks_unfrozen': 0,
+                'total_blocks': model.regime_info['total_blocks'],
+                'unfrozen_block_indices': [],
+                'unfrozen_layer_names': [],
+                'stage1_epochs': cfg.get('stage1_epochs', 1),
+                'stage1_lr_backbone': cfg.get('stage1_lr_backbone', 1e-5),
+            }
+            model._summary = compute_param_summary(model)
+            print_param_summary(model._summary, 'staged_partial(stage2:frozen)')
+
+            # Save stage1 completion marker
+            os.makedirs(save_dir, exist_ok=True)
+            with open(stage1_flag, 'w') as f:
+                f.write(f"stage1_epochs={cfg.get('stage1_epochs', 1)}\n")
+            print(f"[Staged] Stage1 marker saved: {stage1_flag}")
+
+            # Reset trainer for stage 2
+            trainer.reset_for_stage(stage2_cfg_patch)
+            trainer.train()
+
+    else:
+        # ── Standard single-stage training ──
+        trainer = SelectorTrainer(
+            model=model, cfg=cfg, data_loaders=data_loaders,
+            dataset_config=dataset_config, device=device,
+        )
+        trainer.train()
 
 
 if __name__ == '__main__':
