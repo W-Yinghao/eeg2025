@@ -4,9 +4,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --hint=nomultithread
 #SBATCH --time=20:00:00
-#SBATCH -A ifd@h100
-#SBATCH -p gpu_p6
-#SBATCH -C h100
+#SBATCH -A ifd@a100
+#SBATCH -p gpu_p5
+#SBATCH -C a100
 
 ################################################################################
 # Exp 6B P1 — Gentle Partial Selector (lr_backbone=1e-5) — Jean Zay H100
@@ -24,7 +24,7 @@
 set -e
 
 module purge
-module load pytorch-gpu/py3/2.8.0
+module load pytorch-gpu/py3/2.6.0
 export PYTHONUSERBASE=$WORK/.local_pt260
 export WANDB_MODE=offline
 
