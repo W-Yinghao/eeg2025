@@ -1,17 +1,19 @@
 """
-Loss functions for selector experiments (Exp 6/7).
+Loss functions for selector experiments (Exp 6/7/7C).
 
 Supports:
   - CE only (Exp 6: baseline and selector)
-  - CE + sparse regularization (Exp 7)
-  - CE + consistency regularization (Exp 7)
+  - CE + sparse regularization (Exp 7A)
+  - CE + consistency regularization (Exp 7B)
   - CE + sparse + consistency (Exp 7)
+  - CE + branch-aware sparse + consistency (Exp 7C)
   - CE + VIB KL (extension point, disabled by default)
 
 Sparse regularization options:
   - L1 on gate activations (encourage sparse selection)
   - Gate entropy penalty (encourage binary decisions)
   - Coverage penalty (penalize selecting too many tokens)
+  - Branch-aware: separate lambda per gate branch (temporal vs frequency)
 
 Consistency regularization:
   - Applied between gate maps of original and augmented views
@@ -33,6 +35,9 @@ class SelectorLoss(nn.Module):
         enable_sparse: bool = False,
         sparse_lambda: float = 1e-3,
         sparse_type: str = 'l1',  # 'l1' | 'entropy' | 'coverage'
+        # Branch-aware sparse (Exp 7C): per-gate lambdas override sparse_lambda
+        sparse_lambda_temporal: Optional[float] = None,
+        sparse_lambda_frequency: Optional[float] = None,
         # Consistency regularization
         enable_consistency: bool = False,
         consistency_lambda: float = 1e-2,
@@ -49,6 +54,10 @@ class SelectorLoss(nn.Module):
         self.enable_sparse = enable_sparse
         self.sparse_lambda = sparse_lambda
         self.sparse_type = sparse_type
+        self.sparse_lambda_temporal = sparse_lambda_temporal
+        self.sparse_lambda_frequency = sparse_lambda_frequency
+        self._branch_aware = (sparse_lambda_temporal is not None
+                              or sparse_lambda_frequency is not None)
         self.enable_consistency = enable_consistency
         self.consistency_lambda = consistency_lambda
         self.consistency_type = consistency_type
@@ -102,10 +111,25 @@ class SelectorLoss(nn.Module):
 
         if model_out is not None:
             # Sparse regularization
-            if self.enable_sparse and self.sparse_lambda > 0:
+            if self.enable_sparse and self._branch_aware:
+                # Branch-aware sparse (Exp 7C): separate lambda per gate
+                sp_t, sp_f = self._compute_sparse_per_branch(model_out)
+                lam_t = self.sparse_lambda_temporal or 0.0
+                lam_f = self.sparse_lambda_frequency or 0.0
+                sparse_weighted = lam_t * sp_t + lam_f * sp_f
+                total = total + sparse_weighted
+                # Log individual branch losses + combined for compatibility
+                n = int(sp_t > 0) + int(sp_f > 0)
+                loss_dict['sparse'] = ((sp_t.item() + sp_f.item()) / max(n, 1))
+                loss_dict['sparse_temporal'] = sp_t.item()
+                loss_dict['sparse_frequency'] = sp_f.item()
+            elif self.enable_sparse and self.sparse_lambda > 0:
                 sparse_loss = self._compute_sparse_loss(model_out)
                 total = total + self.sparse_lambda * sparse_loss
                 loss_dict['sparse'] = sparse_loss.item()
+                # Per-branch breakdown for analysis (always available)
+                loss_dict['sparse_temporal'] = self._last_sparse_per_branch.get('temporal', 0.0)
+                loss_dict['sparse_frequency'] = self._last_sparse_per_branch.get('frequency', 0.0)
 
             # Consistency regularization
             if (self.enable_consistency and self.consistency_lambda > 0
@@ -128,34 +152,69 @@ class SelectorLoss(nn.Module):
         return total, loss_dict
 
     def _compute_sparse_loss(self, model_out: Dict) -> torch.Tensor:
-        """Compute sparse regularization on gate activations."""
+        """Compute sparse regularization on gate activations.
+
+        Also stores per-branch values in self._last_sparse_per_branch
+        for logging even in uniform mode.
+        """
         device = model_out['logits'].device
         sparse_loss = torch.tensor(0.0, device=device)
         n_gates = 0
+        self._last_sparse_per_branch = {}
 
         for key in ('temporal_gate', 'frequency_gate'):
             gate = model_out.get(key)
             if gate is None:
                 continue
 
-            if self.sparse_type == 'l1':
-                # L1: penalize mean gate activation -> encourage low activations
-                sparse_loss = sparse_loss + gate.mean()
-            elif self.sparse_type == 'entropy':
-                # Entropy: penalize high entropy -> encourage binary gates
-                g = gate.squeeze(-1).clamp(1e-7, 1 - 1e-7)
-                entropy = -(g * g.log() + (1 - g) * (1 - g).log())
-                sparse_loss = sparse_loss + entropy.mean()
-            elif self.sparse_type == 'coverage':
-                # Coverage: penalize fraction of gates > threshold
-                active_ratio = (gate > 0.5).float().mean()
-                sparse_loss = sparse_loss + active_ratio
+            val = self._sparse_single_gate(gate)
+            sparse_loss = sparse_loss + val
+            branch = 'temporal' if key == 'temporal_gate' else 'frequency'
+            self._last_sparse_per_branch[branch] = val.item()
             n_gates += 1
 
         if n_gates > 0:
             sparse_loss = sparse_loss / n_gates
 
         return sparse_loss
+
+    def _compute_sparse_per_branch(
+        self, model_out: Dict
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute sparse loss separately for temporal and frequency gates.
+
+        Returns (sparse_temporal, sparse_frequency) as individual scalars.
+        Used by branch-aware sparse mode (Exp 7C) where each branch has
+        its own lambda.
+        """
+        device = model_out['logits'].device
+        sparse_t = torch.tensor(0.0, device=device)
+        sparse_f = torch.tensor(0.0, device=device)
+
+        for key, target in [('temporal_gate', 'temporal'),
+                            ('frequency_gate', 'frequency')]:
+            gate = model_out.get(key)
+            if gate is None:
+                continue
+            val = self._sparse_single_gate(gate)
+            if target == 'temporal':
+                sparse_t = val
+            else:
+                sparse_f = val
+
+        return sparse_t, sparse_f
+
+    def _sparse_single_gate(self, gate: torch.Tensor) -> torch.Tensor:
+        """Compute sparse penalty for a single gate tensor."""
+        if self.sparse_type == 'l1':
+            return gate.mean()
+        elif self.sparse_type == 'entropy':
+            g = gate.squeeze(-1).clamp(1e-7, 1 - 1e-7)
+            entropy = -(g * g.log() + (1 - g) * (1 - g).log())
+            return entropy.mean()
+        elif self.sparse_type == 'coverage':
+            return (gate > 0.5).float().mean()
+        return torch.tensor(0.0, device=gate.device)
 
     def _compute_consistency_loss(
         self,

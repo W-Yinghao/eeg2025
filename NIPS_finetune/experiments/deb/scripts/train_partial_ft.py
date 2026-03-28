@@ -118,6 +118,11 @@ def parse_args():
     parser.add_argument('--sparse_lambda', type=float, default=1e-3)
     parser.add_argument('--sparse_type', type=str, default='l1',
                         choices=['l1', 'entropy', 'coverage'])
+    # Branch-aware sparse (Exp 7C): per-gate lambdas
+    parser.add_argument('--sparse_lambda_temporal', type=float, default=None,
+                        help='Sparse lambda for temporal gate only (overrides sparse_lambda)')
+    parser.add_argument('--sparse_lambda_frequency', type=float, default=None,
+                        help='Sparse lambda for frequency gate only (overrides sparse_lambda)')
 
     # Consistency regularization (Exp 7)
     parser.add_argument('--enable_consistency', action='store_true',

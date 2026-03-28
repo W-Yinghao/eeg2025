@@ -70,6 +70,8 @@ class SelectorTrainer:
             enable_sparse=cfg.get('enable_sparse', False),
             sparse_lambda=cfg.get('sparse_lambda', 1e-3),
             sparse_type=cfg.get('sparse_type', 'l1'),
+            sparse_lambda_temporal=cfg.get('sparse_lambda_temporal'),
+            sparse_lambda_frequency=cfg.get('sparse_lambda_frequency'),
             enable_consistency=cfg.get('enable_consistency', False),
             consistency_lambda=cfg.get('consistency_lambda', 1e-2),
             consistency_type=cfg.get('consistency_type', 'l2'),
@@ -281,8 +283,13 @@ class SelectorTrainer:
         if self.start_epoch > 1:
             print(f"  Resuming from epoch {self.start_epoch}")
         if cfg.get('enable_sparse'):
-            print(f"  Sparse: {cfg.get('sparse_type','l1')} "
-                  f"lambda={cfg.get('sparse_lambda',0)}")
+            if cfg.get('sparse_lambda_temporal') is not None or cfg.get('sparse_lambda_frequency') is not None:
+                print(f"  Sparse (branch-aware): {cfg.get('sparse_type','l1')} "
+                      f"lambda_t={cfg.get('sparse_lambda_temporal', 0)} "
+                      f"lambda_f={cfg.get('sparse_lambda_frequency', 0)}")
+            else:
+                print(f"  Sparse: {cfg.get('sparse_type','l1')} "
+                      f"lambda={cfg.get('sparse_lambda',0)}")
         if cfg.get('enable_consistency'):
             print(f"  Consistency: {cfg.get('consistency_type','l2')} "
                   f"lambda={cfg.get('consistency_lambda',0)}")
@@ -658,6 +665,7 @@ class SelectorTrainer:
         stats = {}
         labels = np.array(all_labels)
         abnormal_mask = (labels == 0)
+        normal_mask = (labels == 1)
 
         if all_gate_t:
             gt = torch.cat(all_gate_t, dim=0).float()  # (N, S, 1)
@@ -680,6 +688,16 @@ class SelectorTrainer:
                 ent_a = -(g_a * g_a.log() + (1 - g_a) * (1 - g_a).log())
                 stats['abnormal_only_gate_entropy_temporal'] = ent_a.mean().item()
                 stats.update(self._compute_topk_ratios(gt_abn, prefix='abnormal_only_temporal'))
+            # Normal-only
+            if normal_mask.sum() > 0:
+                gt_norm = gt_vals[normal_mask]
+                stats['normal_only_g_t_mean'] = gt_norm.mean().item()
+                stats['normal_only_g_t_std'] = gt_norm.std().item()
+                stats['normal_only_gate_coverage_temporal'] = (gt_norm > 0.5).float().mean().item()
+                g_n = gt_norm.clamp(1e-7, 1 - 1e-7)
+                ent_n = -(g_n * g_n.log() + (1 - g_n) * (1 - g_n).log())
+                stats['normal_only_gate_entropy_temporal'] = ent_n.mean().item()
+                stats.update(self._compute_topk_ratios(gt_norm, prefix='normal_only_temporal'))
 
         if all_gate_f:
             gf = torch.cat(all_gate_f, dim=0).float()  # (N, C, 1)
@@ -701,6 +719,16 @@ class SelectorTrainer:
                 ent_a = -(g_a * g_a.log() + (1 - g_a) * (1 - g_a).log())
                 stats['abnormal_only_gate_entropy_frequency'] = ent_a.mean().item()
                 stats.update(self._compute_topk_ratios(gf_abn, prefix='abnormal_only_frequency'))
+            # Normal-only
+            if normal_mask.sum() > 0:
+                gf_norm = gf_vals[normal_mask]
+                stats['normal_only_g_f_mean'] = gf_norm.mean().item()
+                stats['normal_only_g_f_std'] = gf_norm.std().item()
+                stats['normal_only_gate_coverage_frequency'] = (gf_norm > 0.5).float().mean().item()
+                g_n = gf_norm.clamp(1e-7, 1 - 1e-7)
+                ent_n = -(g_n * g_n.log() + (1 - g_n) * (1 - g_n).log())
+                stats['normal_only_gate_entropy_frequency'] = ent_n.mean().item()
+                stats.update(self._compute_topk_ratios(gf_norm, prefix='normal_only_frequency'))
 
         # Combined gate stats (average of temporal + frequency where both exist)
         t_ent = stats.get('gate_entropy_temporal')
@@ -731,6 +759,21 @@ class SelectorTrainer:
         elif at_cov is not None:
             stats['abnormal_only_gate_coverage'] = at_cov
 
+        # Normal-only combined stats
+        nt_ent = stats.get('normal_only_gate_entropy_temporal')
+        nf_ent = stats.get('normal_only_gate_entropy_frequency')
+        if nt_ent is not None and nf_ent is not None:
+            stats['normal_only_gate_entropy'] = (nt_ent + nf_ent) / 2
+        elif nt_ent is not None:
+            stats['normal_only_gate_entropy'] = nt_ent
+
+        nt_cov = stats.get('normal_only_gate_coverage_temporal')
+        nf_cov = stats.get('normal_only_gate_coverage_frequency')
+        if nt_cov is not None and nf_cov is not None:
+            stats['normal_only_gate_coverage'] = (nt_cov + nf_cov) / 2
+        elif nt_cov is not None:
+            stats['normal_only_gate_coverage'] = nt_cov
+
         # Combined top-K ratios (average temporal + frequency)
         for k_pct in (10, 20):
             t_val = stats.get(f'gate_top{k_pct}_ratio_temporal')
@@ -739,6 +782,13 @@ class SelectorTrainer:
                 stats[f'gate_top{k_pct}_ratio'] = (t_val + f_val) / 2
             elif t_val is not None:
                 stats[f'gate_top{k_pct}_ratio'] = t_val
+
+        # Cross-class delta/ratio for frequency gate (class bias indicator)
+        abn_gf = stats.get('abnormal_only_g_f_mean')
+        norm_gf = stats.get('normal_only_g_f_mean')
+        if abn_gf is not None and norm_gf is not None:
+            stats['delta_gf_abn_minus_norm'] = abn_gf - norm_gf
+            stats['ratio_gf_abn_over_norm'] = abn_gf / max(norm_gf, 1e-8)
 
         return stats
 
