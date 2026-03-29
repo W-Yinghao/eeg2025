@@ -5,7 +5,7 @@
 #SBATCH --hint=nomultithread
 #SBATCH --time=20:00:00
 #SBATCH -A ifd@v100
-#SBATCH --partition=gpu_p13
+#SBATCH -C v100-32g
 
 ################################################################################
 # Exp 6B P3e1 — Staged Partial Selector (stage1=1 ep) — Jean Zay H100

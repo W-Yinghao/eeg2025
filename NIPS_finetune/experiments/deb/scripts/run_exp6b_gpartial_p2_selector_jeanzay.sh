@@ -5,7 +5,7 @@
 #SBATCH --hint=nomultithread
 #SBATCH --time=20:00:00
 #SBATCH -A ifd@v100
-#SBATCH --partition=gpu_p13
+#SBATCH -C v100-32g
 
 ################################################################################
 # Exp 6B P2 — Gentle Partial Selector (lr_backbone=1e-6) — Jean Zay H100
