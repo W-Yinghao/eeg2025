@@ -5,7 +5,7 @@
 #SBATCH --hint=nomultithread
 #SBATCH --time=20:00:00
 #SBATCH -A ifd@v100
-#SBATCH -C v100-32g
+#SBATCH --partition=gpu_p13
 #SBATCH --signal=B:USR1@180
 
 ################################################################################
@@ -74,12 +74,11 @@ python experiments/deb/scripts/train_partial_ft.py \
     --seed "$SEED" \
     --cuda 0 \
     --save_dir "$SAVE_DIR" \
-    --num_workers 4 \
+    --num_workers 8 \
     --wandb_project eeg_selector_exp6a \
     --wandb_run_name "$TAG" \
     --split_strategy subject \
     --eval_test_every_epoch \
-    --amp \
     --resume "$SAVE_DIR" \
     && EXIT_CODE=0 || EXIT_CODE=$?
 

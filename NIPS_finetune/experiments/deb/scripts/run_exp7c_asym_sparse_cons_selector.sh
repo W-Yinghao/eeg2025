@@ -98,7 +98,6 @@ python experiments/deb/scripts/train_partial_ft.py \
     --wandb_run_name "$TAG" \
     --split_strategy subject \
     --eval_test_every_epoch \
-    --amp \
     --resume "$SAVE_DIR" \
     && EXIT_CODE=0 || EXIT_CODE=$?
 

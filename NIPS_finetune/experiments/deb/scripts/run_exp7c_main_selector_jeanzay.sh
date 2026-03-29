@@ -90,7 +90,7 @@ python experiments/deb/scripts/train_partial_ft.py \
     --seed "$SEED" \
     --cuda 0 \
     --save_dir "$SAVE_DIR" \
-    --num_workers 4 \
+    --num_workers 8 \
     --wandb_project eeg_selector_exp7c \
     --wandb_run_name "$TAG" \
     --split_strategy subject \
